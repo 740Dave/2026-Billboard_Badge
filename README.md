@@ -20,3 +20,16 @@ Buttons are
 
 * Menu +/-: GPIO40 / GPIO15
 * User A/B: GPIO39 / GPIO15  
+
+# Displaying Images
+
+The badge's display only supports three colors: white, black, red. Shading between those needs to be implemented by dithering pixels of those colors together. Unlike LCD, CRT, or other displays you may be used to, you cannot set multiple colors within a single pixel, each pixel is only one of the three colors.
+
+The badge firmware picks a color for each pixel based on this logic:
+- If the red value is >50% and blue and green are both <50%, then the pixel will be red.
+- If the red, green, and blue values of the pixel are all <50%, then the pixel will be black.
+- Otherwise the pixel will be white.
+
+Additionally, since the display is so large, loading large images can easily run out of memory. Therefore, it is best to compress each image down to a limited color space before placing on the badge. This is easily done with [ImageMagick](https://imagemagick.org/), namely with the command `magick oldfile.png -remap scripts/palette.gif newfile.png`. This reduces the image down to a colorspace that only supports 3 colors, which are white, black, and red.
+
+Based on the above pixel logic, where each pixel is already one of the three supported colors, it's easy to see how the image will be displayed. Luckily, but converting the image on your computer, you can see what it will look like before rendering it on the badge.
