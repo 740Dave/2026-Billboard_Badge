@@ -1,0 +1,10 @@
+
+[MCU.esp32]
+BOARD = "ESP32_GENERIC_S3"
+BOARD_VARIANT = "SPIRAM_OCT"
+octal_flash = true
+flash_size = 16
+enable_jtag_repl = 'n'
+enable_cdc_repl = 'n'
+enable_uart_repl = 'y'
+uart_repl_bitrate = 115200

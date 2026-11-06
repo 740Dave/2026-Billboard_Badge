@@ -1,0 +1,15 @@
+{
+    "mcu": "esp32s3",
+    "product": "ESP32-S3",
+    "url": "https://hackaday.com",
+    "vendor": "Hackaday",
+    "variants": {
+        "SPIRAM_OCT": "Support for Octal-SPIRAM"
+    },
+    "features": [
+        "BLE",
+        "External Flash",
+        "External RAM",
+        "WiFi"
+    ]
+}

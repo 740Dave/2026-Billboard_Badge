@@ -1,0 +1,1 @@
+python -m esptool --no-stub read_flash 0 8M $1.bin
