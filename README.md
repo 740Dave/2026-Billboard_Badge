@@ -1,9 +1,9 @@
 ![Billboard_Badge](assets/frame_graphic_demo.png "2026 Hackaday Supercon Billboard Badge")
 
-## Badge Hardware
+# Badge Hardware
 The badge uses a 9.7 inch Pervasive Displays E2969JS0B1 electronic paper panel that was recycled from price tags which were destined for a now bankrupt German department store chain, coupled with an ESP32-S3 microcontroller.
 
-# Pins
+## Pins
 
 The board only has two truly free GPIOs
 
@@ -19,12 +19,15 @@ The SAO ports, however, have many possibilities
 
 The row of WS2812-compatible LEDs is on GPIO38
 
-# Buttons
+## Buttons
 
 * Menu +/-: GPIO40 / GPIO15
-* User A/B: GPIO39 / GPIO15  
+* User A/B: GPIO39 / GPIO15
 
-## Displaying Images
+# Applications
+In its out of the box configuration the badge can show the 2026 Supercon schedule, act as a digital name tag, and cycle through a built-in collection of art from Hackaday's incredible Art Director Joe Kim. If you come up with additional apps that you'd like to share, feel free to make a pull request.
+
+# Displaying Images
 
 The badge's display only supports three colors: white, black, red. Shading between those needs to be implemented by dithering pixels of those colors together. Unlike LCD, CRT, or other displays you may be used to, you cannot set multiple colors within a single pixel, each pixel is only one of the three colors.
 
