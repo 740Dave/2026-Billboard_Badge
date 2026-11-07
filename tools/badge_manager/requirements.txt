@@ -1,0 +1,6 @@
+customtkinter
+mpremote
+esptool
+pillow
+keyring
+pyserial
