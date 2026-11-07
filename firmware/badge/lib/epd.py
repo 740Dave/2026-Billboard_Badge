@@ -326,7 +326,7 @@ class EPaperDisplay:
         """
         self._send_index_data(0x09, [0x7F, 0x7D, 0x00])
         await aio.sleep_ms(200)
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+        while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
             await aio.sleep_ms(1)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
@@ -370,7 +370,7 @@ class EPaperDisplay:
         EPD_CS2_PIN.value(True)
 
     async def _display_refresh(self):
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+        while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
             await aio.sleep_ms(100)
         self._send_index_data(0x15, [0x3C])
         await aio.sleep_ms(5)
@@ -461,13 +461,13 @@ class EPaperDisplay:
         Implemented after image data are uploaded to CoG
         Specific to mid-sized EPDs only
         """
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+        while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
             await aio.sleep_ms(100)
         self._send_index_data(0x09, [0x7F])
         self._send_index_data(0x05, [0x7D])
         self._send_index_data(0x09, [0x00])
         await aio.sleep_ms(200)
-        while not EPD_BUSY1_PIN.value() or not EPD_BUSY2_PIN.value():
+        while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
             await aio.sleep_ms(100)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
