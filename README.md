@@ -27,6 +27,8 @@ The row of WS2812-compatible LEDs is on GPIO38
 # Applications
 In its out of the box configuration the badge can show the 2026 Supercon schedule, act as a digital name tag, and cycle through a built-in collection of art from Hackaday's incredible Art Director Joe Kim. If you come up with additional apps that you'd like to share, feel free to make a pull request.
 
+Press Menu +/- to open the app menu, Menu +/- to pick an app, and User A or B to launch it. The badge remembers the last app launched from the menu (in `/data/last_app.json`) and starts it again at the next boot. Hold Menu + or Menu - while the badge boots to get the menu instead. To always boot into the menu, create `/data/boot.json` containing `{"resume": false}`.
+
 # Displaying Images
 
 The badge's display only supports three colors: white, black, red. Shading between those needs to be implemented by dithering pixels of those colors together. Unlike LCD, CRT, or other displays you may be used to, you cannot set multiple colors within a single pixel, each pixel is only one of the three colors.

@@ -1,6 +1,7 @@
 """App Switcher"""
 
 import asyncio as aio  # type: ignore
+import json
 import os
 import sys
 import btree
@@ -18,10 +19,16 @@ APPMOD_DENYLIST = {
     "template",
 }
 
+LAST_APP_FILE = "/data/last_app.json"
+"""Remembers the last app launched from the menu so it can be resumed at boot"""
+BOOT_CONFIG_FILE = "/data/boot.json"
+"""Optional. {"resume": false} always starts in the menu"""
+
 
 class AppSwitcher:
     def __init__(self, initial_idx: int = 0) -> None:
         self.apps = []
+        self.app_mods = []  # module name of each app, parallel to self.apps
         self.active_idx = initial_idx
         self.selecting_mode = True
         self.selection_idx = initial_idx
@@ -55,6 +62,7 @@ class AppSwitcher:
                         continue
                     app = modattr()
                     self.apps.append(app)
+                    self.app_mods.append(appmod_name)
                     print(f"Added app: {app.name}")
             except Exception as exc:
                 print(f"Failed to load app module: {appmod}")
@@ -72,6 +80,58 @@ class AppSwitcher:
         apps_db.close()
         apps_file.close()
 
+        self._resume_last_app()
+
+    def _resume_last_app(self):
+        """Start the last app launched from the menu instead of the menu.
+        Hold Menu+ or Menu- during boot to get the menu instead.
+        Any problem falls back to the menu."""
+        if MenuPlus.pin.value() or MenuMinus.pin.value():
+            print("Menu button held at boot, showing menu")
+            # Don't let the held button also move the menu selection
+            MenuMinus._pressed_state = PRESSED_READ
+            MenuPlus._pressed_state = PRESSED_READ
+            return
+        try:
+            try:
+                with open(BOOT_CONFIG_FILE) as f:
+                    if json.load(f).get("resume", True) is False:
+                        return
+            except OSError:
+                pass  # no boot config, resume is on by default
+            try:
+                with open(LAST_APP_FILE) as f:
+                    last = json.load(f)
+            except OSError:
+                return  # nothing launched yet
+            for idx, app in enumerate(self.apps):
+                if self.app_mods[idx] == last["module"] and app.name == last["app"]:
+                    print(f"Resuming {app.name}")
+                    self.active_idx = idx
+                    self.selection_idx = idx
+                    app.launched = True
+                    self.selecting_mode = False
+                    return
+            print(f"Last app {last} not found, showing menu")
+        except Exception as exc:
+            print("Could not resume last app, showing menu")
+            sys.print_exception(exc)
+
+    def _save_last_app(self):
+        """Remember the active app. Only writes to flash when it changed."""
+        last = {"module": self.app_mods[self.active_idx], "app": self.apps[self.active_idx].name}
+        try:
+            try:
+                with open(LAST_APP_FILE) as f:
+                    if json.load(f) == last:
+                        return
+            except (OSError, ValueError):
+                pass
+            with open(LAST_APP_FILE, "w") as f:
+                json.dump(last, f)
+        except Exception as exc:
+            print("Could not save last app")
+            sys.print_exception(exc)
 
     async def arun(self):
         while True:
@@ -94,6 +154,7 @@ class AppSwitcher:
                     print(f"Switching to {self.apps[self.selection_idx].name}")
                     self.active_idx = self.selection_idx
                     self.apps[self.active_idx].launched = True
+                    self._save_last_app()
                     leds.clear_sequence()
                     leds.fill((0, 0, 0))
                     leds.write()
