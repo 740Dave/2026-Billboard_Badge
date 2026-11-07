@@ -5,13 +5,15 @@ A desktop app (customtkinter) for managing the Hackaday Supercon 2026 Billboard 
 ## Run it
 
 ```bash
-cd ~/Desktop/hackaday/badge_manager && .venv/bin/python app.py
+cd tools/badge_manager
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py
 ```
 
 To try it **without a badge**, use a simulated badge (a temp folder seeded from upstream):
 
 ```bash
-cd ~/Desktop/hackaday/badge_manager && BADGE_FAKE=1 .venv/bin/python app.py
+BADGE_FAKE=1 .venv/bin/python app.py
 ```
 
 **Badge checklist:**
@@ -26,9 +28,10 @@ cd ~/Desktop/hackaday/badge_manager && BADGE_FAKE=1 .venv/bin/python app.py
 | **Top bar** (always visible) | Port picker, Connect, **Hard reset**, connection state with firmware version and voltage, busy indicator |
 | **Device** | Status (RAM, storage, USB or battery). File browser (view, download, upload, delete). Full backup and restore. **Lab**: LED test, SAO/I²C scan, voltage, run a Python snippet, "Restore badge UI" |
 | **Firmware** | Upstream and every fork branch as a list: newest changes first, ahead/behind counts, whether each touches badge files. Unique commits and diffs, a **compare with badge** view (`*` changed, `+` new, `-` extra), and **Install** with an automatic backup. The *Runtime* page (advanced) covers esptool flash backup, flashing MicroPython, and factory restore |
-| **Apps** | What's on the badge, with LED menu positions. Enable/disable (renames to `_name.py`, which the badge skips) and remove. A catalog of every app in every fork plus local folders, with dependency-aware install that pulls in needed `lib/` and `/data` files and never overwrites core libs |
+| **Apps** | What's on the badge, with LED menu positions. Enable/disable (renames to `_name.py`, which the badge skips) and remove. A catalog of every app in every fork plus local folders, with dependency-aware install that pulls in needed `lib/` and `/data` files and never overwrites core libs. **Start at boot**: shows whether the badge resumes the last app (`/data/boot.json`, `/data/last_app.json`; needs the resume-last-app firmware) and sets it |
 | **Artwork** | Thumbnails of `/data/artwork`: reorder, delete, show next. Add images with a live white/black/red preview (fit/fill, dither, red, rotate), convert, and upload. Installs the Artwork app if it's missing |
-| **Settings** | **Wi-Fi networks** master/detail: profiles in priority order, passwords in the macOS Keychain, write and read `/data/wifi.json` (kcriqui's `lib/wifi.py` format), test on the badge. **General**: appearance, backup folder, backup-before-install, local app folders, GitHub token |
+| **Maker Detector** | Your maker handle (read-only, from Settings → User Settings), the broadcast switch, writing `/data/owner.json` (+ legacy `/data/maker.json`), installing the badge app. Optional, experimental Mac-side BLE scan in a helper process |
+| **Settings** | **User Settings**: maker handle (a handle, not your legal name), what you make, broadcast on/off, Save & send to badge. **Wi-Fi networks** master/detail: profiles in priority order, passwords in the macOS Keychain, write and read `/data/wifi.json` (kcriqui's `lib/wifi.py` format), test on the badge. **General**: appearance, backup folder, backup-before-install, local app folders, GitHub token |
 | **Log** (bottom) | Every badge command and result. Hide or clear as needed |
 
 ## Safety rules built in
@@ -58,7 +61,7 @@ tests/harness.py     smoke test: BADGE_FAKE=1 .venv/bin/python tests/harness.py 
 
 **Adding a tab:** create `tabs/foo.py` with `class FooTab(BaseTab)`, then add it to `TABS` in `app.py`. A tab that fails to import shows its error instead of crashing the app.
 
-**Fork data:** the app reuses `~/Desktop/hackaday/repos/upstream` (every fork as a git remote). **Firmware → "Check GitHub for new forks + fetch"** adds new forks and pulls updates. Without a token the GitHub API allows 60 calls an hour; add a token in Settings → General to raise that.
+**Fork data:** when run from a clone of this repo the app uses that clone as its git cache (otherwise `~/.badge_manager/repo`), with every fork added as a git remote. **Firmware → "Check GitHub for new forks + fetch"** adds new forks and pulls updates. Without a token the GitHub API allows 60 calls an hour; add a token in Settings → General to raise that.
 
 ## Status
 

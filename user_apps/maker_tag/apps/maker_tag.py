@@ -1,17 +1,18 @@
-"""Maker Tag: a two-column name tag -- "HI, MY NAME IS" | "I LIKE TO MAKE".
+"""Maker Tag: a two-column name tag -- "HELLO, I AM" | "I MAKE".
 
-Reads (never writes) /data/maker.json, the file the desktop Badge Manager writes and the
-Maker Detector app shares:
-    {"id": "a1b2c3", "name": "Dave", "makes": "robots", "broadcast": true}
-Optional key "display_name" is preferred over "name" (the short broadcast string) when present.
-Missing/invalid file or empty fields -> "Your name" / "Something cool" placeholders plus a hint.
+Reads (never writes) the owner profile the desktop Badge Manager writes:
+    /data/owner.json  {"maker_handle": "dave", "makes": "robots"}
+and falls back to the legacy Maker Detector file for anything missing there:
+    /data/maker.json  {"name": "Dave", "makes": "robots", ...}   ("display_name" beats "name")
+If "makes" is empty the right column is dropped: one full-width "HELLO, I AM" + handle.
+A missing handle shows a "Your maker handle" placeholder plus a hint.
 
 Each column auto-picks the largest Montserrat font (48 down to 16) that fits; text wraps on
-words (name: up to 2 lines, makes: up to 3 lines) and is truncated with "..." as a last resort,
-so it never overflows.
+words (handle: up to 2 lines, makes: up to 3 lines) and is truncated with "..." as a last
+resort, so it never overflows.
 
 Controls while running:
-  User A  re-read /data/maker.json and redraw
+  User A  re-read the profile and redraw
   User B  swap colors (red name / black header band) and redraw
 The screen is drawn once on entry (e-paper refresh takes ~30 s), not every loop.
 LED bar: blue while the panel refreshes, dim green when done.
@@ -29,13 +30,20 @@ from lib.button import UserA, UserB
 from lib.epd import display
 from lib.led_bar import leds
 
+try:
+    from lib.owner import owner as _owner     # optional upstream module (PR "owner-profile")
+except Exception:
+    _owner = None
+
 CONFIG = "/data/maker.json"
+OWNER = "/data/owner.json"
 
 W = 960
 H = 672
 COL_W = W // 2              # 480 per column
 MARGIN = 24
 TEXT_W = COL_W - 2 * MARGIN  # 432 px usable text width per column
+FULL_W = W - 2 * MARGIN      # 912 px when there is only one column
 
 BAND_H = 110                # red header band, y 0..109
 BODY_TOP = BAND_H + 20      # 130
@@ -48,9 +56,10 @@ NAME_LINES = 2
 MAKES_LINES = 3
 SIZES = (48, 46, 44, 42, 40, 38, 36, 34, 32, 30, 28, 26, 24, 22, 20, 18, 16)
 
-PH_NAME = "Your name"
-PH_MAKES = "Something cool"
-HINT = "Set these in Badge Manager > Settings > User Settings"
+HDR_L = "HELLO, I AM"
+HDR_R = "I MAKE"
+PH_NAME = "Your maker handle"
+HINT = "Set it in Badge Manager > Settings > User Settings"
 FOOTER = "Hackaday Supercon 2026"
 
 _WHITE = lvgl.color_hex(0xFFFFFF)
@@ -91,25 +100,71 @@ def _clean(s):
     return " ".join("".join(out).split())
 
 
-def _load():
-    """Return (name, makes, used_placeholder). Never raises, never writes."""
-    cfg = {}
+def _read_json(path):
     try:
-        with open(CONFIG) as f:
-            cfg = json.load(f)
-        if not isinstance(cfg, dict):
-            cfg = {}
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except Exception as ex:
-        print("maker_tag: no usable", CONFIG, ex)
-        cfg = {}
-    name = _clean(cfg.get("display_name")) or _clean(cfg.get("name"))
-    makes = _clean(cfg.get("makes"))
-    placeholder = not name or not makes
-    return (name or PH_NAME), (makes or PH_MAKES), placeholder
+        print("maker_tag: no usable", path, ex)
+        return {}
+
+
+def _read_owner():
+    """Owner profile dict (only keys that are set); lib.owner if present, else the file."""
+    if _owner is not None:
+        try:
+            try:
+                _owner.reload()
+            except Exception:
+                pass
+            d = {}
+            for k in ("maker_handle", "makes"):
+                v = _owner.get(k, None)
+                if v is not None:
+                    d[k] = v
+            return d
+        except Exception as ex:
+            print("maker_tag: lib.owner failed, reading file:", ex)
+    return _read_json(OWNER)
+
+
+def _load():
+    """Return (handle, makes, used_placeholder). makes may be "" (= one-column layout).
+    Never raises, never writes."""
+    own = _read_owner()
+    handle = _clean(own.get("maker_handle")).strip()   # whitespace-only = no handle
+    makes = _clean(own.get("makes")).strip()
+    # Fall back to the legacy file only for keys owner.json doesn't have at all: a handle the
+    # user deliberately left blank must stay blank (not resurrect an old name).
+    if not isinstance(own.get("maker_handle"), str) or not isinstance(own.get("makes"), str):
+        old = _read_json(CONFIG)       # legacy file, only read when needed
+        if not isinstance(own.get("maker_handle"), str):
+            handle = (_clean(old.get("display_name")) or _clean(old.get("name"))).strip()
+        if not isinstance(own.get("makes"), str):
+            makes = _clean(old.get("makes")).strip()
+    return (handle or PH_NAME), makes, not handle
+
+
+_FONT_SIZES = (14, 16, 24, 28, 32, 36, 40, 44, 48)   # what this firmware build compiles in
 
 
 def _font(size):
-    return getattr(lvgl, "font_montserrat_%d" % size, None)
+    """The requested Montserrat size, else the nearest one this firmware has.
+    Never returns None for drawing: a NULL font crashes LVGL when it renders."""
+    f = getattr(lvgl, "font_montserrat_%d" % size, None)
+    if f is not None:
+        return f
+    best = None
+    for s in sorted(_FONT_SIZES, key=lambda s: (abs(s - size), -s)):
+        best = getattr(lvgl, "font_montserrat_%d" % s, None)
+        if best is not None:
+            return best
+    return lvgl.font_get_default()
+
+
+def _has_font(size):
+    return getattr(lvgl, "font_montserrat_%d" % size, None) is not None
 
 
 def _delete(obj):
@@ -189,7 +244,7 @@ def _fit(m, text, max_lines, max_w, max_h, sizes=SIZES):
     """Pick the largest font size whose word-wrap fits. Returns (size, [lines])."""
     words = text.split() or [" "]
     for size in sizes:
-        if _font(size) is None:
+        if not _has_font(size):
             continue
         lh = m.line_h(size)
         lim = min(max_lines, max(1, max_h // max(1, lh)))
@@ -199,7 +254,7 @@ def _fit(m, text, max_lines, max_w, max_h, sizes=SIZES):
     # Last resort: smallest font, shorten over-long words, cap the line count.
     size = sizes[-1]
     for s in reversed(sizes):
-        if _font(s) is not None:
+        if _has_font(s):
             size = s
             break
     words = [w if m.width(w, size) <= max_w else _shorten(m, w, size, max_w, True)
@@ -248,16 +303,26 @@ class MakerTagApp(BaseApp):
         name_color = _RED if self.inverted else _BLACK
 
         body_h = BODY_BOTTOM - BODY_TOP
+        hdr_l, name_lines_max = HDR_L, NAME_LINES
+        if placeholder and makes:
+            # No handle but they told us what they make: one column, "I MAKE" + makes.
+            hdr_l, name, makes, placeholder, name_lines_max = HDR_R, makes, "", False, MAKES_LINES
+            name_color = _BLACK
+        two = bool(makes)               # no "makes": single full-width column
+        col_w = TEXT_W if two else FULL_W
+        k_size, k_lines, k_lh = 0, [], 0
         m = _Measurer()
         try:
-            h_size_l, h_l = _fit(m, "HI, MY NAME IS", 1, TEXT_W, BAND_H - 20)
-            h_size_r, h_r = _fit(m, "I LIKE TO MAKE", 1, TEXT_W, BAND_H - 20)
-            h_size = min(h_size_l, h_size_r)    # same header size on both sides
+            h_size, h_l = _fit(m, hdr_l, 1, col_w, BAND_H - 20)
+            if two:
+                h_size_r, h_r = _fit(m, HDR_R, 1, TEXT_W, BAND_H - 20)
+                h_size = min(h_size, h_size_r)   # same header size on both sides
             h_lh = m.line_h(h_size)
-            n_size, n_lines = _fit(m, name, NAME_LINES, TEXT_W, body_h)
-            k_size, k_lines = _fit(m, makes, MAKES_LINES, TEXT_W, body_h)
+            n_size, n_lines = _fit(m, name, name_lines_max, col_w, body_h)
             n_lh = m.line_h(n_size)
-            k_lh = m.line_h(k_size)
+            if two:
+                k_size, k_lines = _fit(m, makes, MAKES_LINES, TEXT_W, body_h)
+                k_lh = m.line_h(k_size)
         finally:
             m.close()
 
@@ -270,24 +335,26 @@ class MakerTagApp(BaseApp):
         # Row 1: header band, white text knocked out of red (or black).
         self._box(scr, 0, 0, W, BAND_H, band_color)
         hy = (BAND_H - h_lh) // 2
-        self._label(scr, MARGIN, hy, TEXT_W, h_size, _WHITE, "HI, MY NAME IS")
-        self._label(scr, COL_W + MARGIN, hy, TEXT_W, h_size, _WHITE, "I LIKE TO MAKE")
+        self._label(scr, MARGIN, hy, col_w, h_size, _WHITE, hdr_l)
+        if two:
+            self._label(scr, COL_W + MARGIN, hy, TEXT_W, h_size, _WHITE, HDR_R)
+            # Divider between the columns (body area only).
+            self._box(scr, COL_W - DIV_W // 2, BODY_TOP, DIV_W, body_h, _BLACK)
 
-        # Divider between the columns (body area only).
-        self._box(scr, COL_W - DIV_W // 2, BODY_TOP, DIV_W, body_h, _BLACK)
-
-        # Row 2: name and makes, vertically centered in the body area.
+        # Row 2: handle (and makes), vertically centered in the body area.
         ny = BODY_TOP + (body_h - n_lh * len(n_lines)) // 2
-        ky = BODY_TOP + (body_h - k_lh * len(k_lines)) // 2
-        self._label(scr, MARGIN, ny, TEXT_W, n_size, name_color, "\n".join(n_lines))
-        self._label(scr, COL_W + MARGIN, ky, TEXT_W, k_size, _BLACK, "\n".join(k_lines))
+        self._label(scr, MARGIN, ny, col_w, n_size, name_color, "\n".join(n_lines))
+        if two:
+            ky = BODY_TOP + (body_h - k_lh * len(k_lines)) // 2
+            self._label(scr, COL_W + MARGIN, ky, TEXT_W, k_size, _BLACK, "\n".join(k_lines))
 
         if placeholder:
             self._label(scr, MARGIN, HINT_Y, W - 2 * MARGIN, 18, _RED, HINT)
         self._label(scr, MARGIN, FOOT_Y, W - 2 * MARGIN, 20, _BLACK, FOOTER)
 
-        print("maker_tag: fonts header=%d name=%d x%d makes=%d x%d"
-              % (h_size, n_size, len(n_lines), k_size, len(k_lines)))
+        print("maker_tag: %s fonts header=%d handle=%d x%d makes=%d x%d"
+              % ("2-col" if two else "1-col", h_size, n_size, len(n_lines),
+                 k_size, len(k_lines)))
 
         leds.fill((0, 0, 2))            # blue while the panel refreshes
         display.clear()

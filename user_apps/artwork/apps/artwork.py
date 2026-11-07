@@ -5,6 +5,11 @@ Controls (while the app is running):
     User B  -> previous image
     Menu +/- -> back to the app menu (handled by the app switcher)
 
+With two or more images the app also advances to the next one every
+ROTATE_S seconds (5 minutes), counted from when the previous refresh
+finished. /data/artwork is rescanned before each automatic advance, so new
+uploads join the rotation and deleted files are skipped.
+
 Images must be 960x672 (or smaller) palette PNGs, not interlaced.
 Use prepare_artwork.py on your computer to convert any image into that format.
 
@@ -23,9 +28,9 @@ from lib.led_bar import leds
 ART_DIR = "/data/artwork"
 INDEX_FILE = "/data/artwork_index"  # remembers the last image across reboots
 
-# Seconds between automatic advances. 0 turns slideshow mode off.
+# Seconds between automatic advances (only with 2+ images). 0 turns it off.
 # E-paper full refreshes take a while and flash the panel, so keep this long.
-AUTO_ADVANCE_S = 0
+ROTATE_S = 300
 
 _BLUE = (0, 0, 2)
 _GREEN = (0, 1, 0)
@@ -38,9 +43,12 @@ class ArtworkApp(BaseApp):
         self.sleep_ms = 50
         self.files = []
         self.index = self._load_index()
+        self.saved_index = self.index  # what is in INDEX_FILE (limits flash writes)
         self.pending = 0          # net next/previous presses not yet drawn
         self.needs_draw = False
-        self.last_draw = 0
+        self.drawing = False      # a refresh was started and has not finished yet
+        self.draw_ok = False
+        self.last_done = time.ticks_ms()  # when the last refresh finished
 
     # ---- helpers -------------------------------------------------------
     def _scan(self):
@@ -58,13 +66,18 @@ class ArtworkApp(BaseApp):
             return 0
 
     def _save_index(self):
+        if self.index == self.saved_index:
+            return
         try:
             with open(INDEX_FILE, "w") as f:
                 f.write(str(self.index))
+            self.saved_index = self.index
         except OSError:
             pass
 
     def _draw(self):
+        self.drawing = True
+        self.draw_ok = False
         if not self.files:
             print(f"Artwork: no .png files in {ART_DIR}")
             leds.fill(_RED)
@@ -78,10 +91,32 @@ class ArtworkApp(BaseApp):
             display.draw_png(path)
             display.update()
             self._save_index()
+            self.draw_ok = True
         except Exception as ex:  # bad file: say so, keep the app alive
             print(f"Artwork: could not draw {path}: {ex}")
             leds.fill(_RED)
-        self.last_draw = time.time()
+
+    def _rotate(self):
+        """Timer fired: rescan and step to the next image (if there are 2+)."""
+        current = None
+        if self.files:
+            current = self.files[self.index % len(self.files)]
+        self._scan()
+        if len(self.files) < 2:
+            return False  # 0 or 1 image: nothing to rotate to, leave the panel alone
+        if current in self.files:
+            self.index = self.files.index(current) + 1
+        else:
+            # The shown file was deleted (or none was shown): go to the first
+            # file that sorts after it, wrapping to the start.
+            self.index = 0
+            if current is not None:
+                for i, n in enumerate(self.files):
+                    if n > current:
+                        self.index = i
+                        break
+        self.index %= len(self.files)
+        return True
 
     # ---- app loop ------------------------------------------------------
     def run(self):
@@ -96,21 +131,30 @@ class ArtworkApp(BaseApp):
         if UserB.pressed():
             self.pending -= 1
 
-        if AUTO_ADVANCE_S and self.files and time.time() - self.last_draw >= AUTO_ADVANCE_S:
-            self.pending += 1
-
         # Only touch the framebuffer once the previous refresh has finished;
         # a display.update() issued mid-refresh is silently dropped.
         if not display.is_done_updating():
             return
+
+        now = time.ticks_ms()
+        if self.drawing:
+            # Refresh just finished: the rotation timer counts from here.
+            self.drawing = False
+            self.last_done = now
+            if self.draw_ok:
+                leds.fill(_GREEN)
 
         if self.pending and self.files:
             self.index = (self.index + self.pending) % len(self.files)
             self.pending = 0
             self.needs_draw = True
 
+        if (not self.needs_draw and ROTATE_S
+                and time.ticks_diff(now, self.last_done) >= ROTATE_S * 1000):
+            self.last_done = now  # restart the timer whether or not we rotate
+            if self._rotate():
+                self.needs_draw = True
+
         if self.needs_draw:
             self.needs_draw = False
             self._draw()
-        elif self.files and leds[0] == _BLUE:
-            leds.fill(_GREEN)  # refresh finished

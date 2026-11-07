@@ -1,65 +1,66 @@
-"""Maker Detector tab: configure and install the BLE "Maker Detector" badge app.
+"""Maker Detector tab: broadcast switch, badge profile files, and installing the BLE "Maker Detector" app.
 
-The badge app (maker_detector.py; see core.onboarding.local_app_candidates) counts other badges
-nearby over BLE. Each badge reads /data/maker.json =
-    {"id": "<6 hex>", "name": "<broadcast text, <=16 ASCII>", "makes": "<local only, <=40>", "broadcast": bool}
-and creates "id" itself if missing (migrating /data/nerd.json from the old Nerd Detector).
-It advertises (non-connectable, legacy 31-byte adv):
+Identity comes from the user profile (Settings > User Settings): the maker handle is shown here
+read-only. Applying writes
+    /data/owner.json  {"maker_handle", "makes", "broadcast", ...other keys kept}   (lib/owner.py, presence)
+    /data/maker.json  {"id", "name": <broadcast text>, "makes", "broadcast"}       (older Maker Detector)
+Broadcast text = handle reduced to printable ASCII, clipped to 16 (core.onboarding.broadcast_text).
+The badge app advertises (non-connectable, legacy 31-byte adv):
     02 01 06                                  flags
     LL FF  FF FF  'S' 'C' '2' '6'  01  id(3)  name(0-16)   manufacturer-specific AD
 On the badge: A = redraw now, B = toggle broadcast.
 
 Badge I/O helpers live in core.onboarding (shared with the first-run wizard); everything runs on
 ctx.run_device_task. Installing always validates the import on the badge and HARD resets.
+
+The optional Mac-side BLE scan runs in a child process (core/ble_scan.py): macOS kills a process
+that touches CoreBluetooth without Bluetooth permission, so bleak is never imported here.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
+import subprocess
+import sys
+from pathlib import Path
 
 import customtkinter as ctk
 
 from core import onboarding as ob
+from core.ble_scan import COMPANY_ID, MAGIC, VERSION, parse_maker_payload  # noqa: F401  (re-exported)
 from core.theme import COLORS
 from tabs.base import BaseTab, Section, confirm, info
 
+OWNER_PATH = ob.OWNER_PATH
 SETTINGS_PATH = ob.SETTINGS_PATH
 BADGE_APP_PATH = ob.BADGE_APP_PATH
 MAX_NAME = ob.MAX_BROADCAST
 MAX_MAKES = ob.MAX_MAKES
-COMPANY_ID = 0xFFFF
-MAGIC = b"SC26"
-VERSION = 0x01
 SCAN_SECONDS = 10
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 validate_name = ob.validate_broadcast
 
+BLE_BLOCKED_MSG = ("macOS blocked Bluetooth for this app. Use a badge to scan instead (Maker Detector on "
+                   "the badge), or run Badge Manager from Terminal.app and allow Terminal under System "
+                   "Settings \u2192 Privacy & Security \u2192 Bluetooth.")
+
 EXPLAINER = (
     "How it works: each badge sends a tiny Bluetooth LE advertisement (manufacturer data, company "
-    "id 0xFFFF): \"SC26\", version 1, a 3-byte id and optionally your broadcast text (up to 16 ASCII "
-    "chars). Badges listen for each other and count distinct makers nearby. Nothing connects, nothing "
-    "is stored off the badge. \"What you make\" stays on your badge and is not broadcast.\n\n"
+    "id 0xFFFF): \"SC26\", version 1, a 3-byte id and the broadcast text: your maker handle as plain "
+    "ASCII, up to 16 characters. Badges listen for each other and count distinct makers nearby. "
+    "Nothing connects, nothing is stored off the badge. \"What you make\" stays on your badge and is "
+    "not broadcast.\n\n"
     "Privacy: the id is random (the badge generates it on first run), not derived from you or your "
-    "hardware. The text is opt-in: leave it empty to broadcast only the anonymous id, or switch "
-    "broadcasting off entirely (also button B on the badge). Anything you broadcast can be read by "
-    "any phone or computer nearby."
+    "hardware. Use a handle, not your legal name. Broadcasting is opt-in: switch it off here, in "
+    "Settings, or with button B on the badge. Anything you broadcast can be read by any phone or "
+    "computer nearby."
 )
 
 
 # ====================================================================== pure helpers
-def parse_maker_payload(data: bytes) -> dict | None:
-    """Parse manufacturer data *after* the company id (as bleak gives it):
-    b"SC26" + version(1) + id(3) + name(0-16). Returns {"version","id","name"} or None."""
-    if not isinstance(data, (bytes, bytearray)) or len(data) < 8 or bytes(data[:4]) != MAGIC:
-        return None
-    version = data[4]
-    if version != VERSION:
-        return None
-    raw_name = bytes(data[8:8 + MAX_NAME])
-    name = "".join(chr(b) if 0x20 <= b <= 0x7E else "?" for b in raw_name)
-    return {"version": version, "id": bytes(data[5:8]).hex(), "name": name}
-
-
 def app_status(badge, local) -> dict:
     """{"installed": bool, "local": bool, "match": bool|None, "old_installed": bool}"""
     try:
@@ -77,29 +78,70 @@ def app_status(badge, local) -> dict:
 
 
 def bleak_available() -> bool:
+    """Is bleak installed? Checked WITHOUT importing it (importing in the GUI process is unsafe)."""
     try:
-        import bleak  # noqa: F401
-        return True
+        return importlib.util.find_spec("bleak") is not None
     except Exception:  # noqa: BLE001
         return False
 
 
+def scan_command(seconds: float) -> list[str]:
+    """Child process that scans and prints JSON (tests replace this)."""
+    return [sys.executable, "-m", "core.ble_scan", str(seconds)]
+
+
+class ScanBlocked(RuntimeError):
+    """macOS (TCC) killed the scanner: no Bluetooth permission."""
+
+
+def run_scan(seconds: float = SCAN_SECONDS, cmd: list[str] | None = None) -> list[dict]:
+    """Blocking (ctx.run_task). Runs the scan in a child process. Raises ScanBlocked if the child
+    was killed by a signal / exit 134 / printed nothing, RuntimeError on other failures."""
+    cmd = cmd or scan_command(seconds)
+    try:
+        proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), capture_output=True, text=True,
+                              timeout=seconds + 25)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Bluetooth scan did not finish within {seconds + 25:.0f} s") from None
+    out = (proc.stdout or "").strip()
+    rc = proc.returncode
+    # SIGABRT shows up as -6 (killed by signal) or 134 (128 + 6, via a shell); TCC kills leave no output.
+    if rc < 0 or rc == 134 or (not out and (rc == 0 or not (proc.stderr or "").strip())):
+        raise ScanBlocked(BLE_BLOCKED_MSG)
+    line = out.splitlines()[-1] if out else ""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        tail = ((proc.stderr or "").strip().splitlines() or [line or f"exit code {rc}"])[-1]
+        raise RuntimeError(f"Bluetooth scan failed: {tail[:200]}") from None
+    if isinstance(data, dict):
+        raise RuntimeError(f"Bluetooth scan failed: {data.get('error', data)}")
+    if rc != 0 or not isinstance(data, list):
+        raise RuntimeError(f"Bluetooth scan failed (exit code {rc})")
+    return data
+
+
 def scan_makers(seconds: float = SCAN_SECONDS) -> list[dict]:
-    """Blocking BLE scan (run in ctx.run_task). Returns [{"id","name","rssi","address"}]."""
-    import asyncio
+    """Old name: [{"id","name","rssi","address"}], via the child process."""
+    return run_scan(seconds)
 
-    from bleak import BleakScanner
 
-    async def go():
-        return await BleakScanner.discover(timeout=seconds, return_adv=True)
-
-    found = {}
-    for addr, (dev, adv) in asyncio.run(go()).items():
-        payload = (adv.manufacturer_data or {}).get(COMPANY_ID)
-        p = parse_maker_payload(payload) if payload else None
-        if p:
-            found[p["id"]] = {"id": p["id"], "name": p["name"], "rssi": adv.rssi, "address": addr}
-    return sorted(found.values(), key=lambda d: -(d["rssi"] or -999))
+def open_user_settings(widget) -> bool:
+    """Jump to Settings > User Settings in the main window. False if not possible (e.g. tests)."""
+    top = widget.winfo_toplevel()
+    tabs = getattr(top, "tabs", None)
+    tv = getattr(top, "tabview", None)
+    st = tabs.get("Settings") if isinstance(tabs, dict) else None
+    if st is None or tv is None:
+        return False
+    tv.set("Settings")
+    try:
+        top._tab_changed()
+    except Exception:  # noqa: BLE001
+        pass
+    if hasattr(st, "show_page"):
+        st.show_page("User Settings")
+    return True
 
 
 # ====================================================================== tab
@@ -113,41 +155,38 @@ class MakerTab(BaseTab):
         prof = ob.get_profile(self.ctx.config)
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
+        muted = COLORS["muted_text"]
 
-        # ---- settings
-        s = Section(scroll, "Badge settings  (/data/maker.json)")
+        # ---- profile + broadcast
+        s = Section(scroll, "Your badge profile  (/data/owner.json, also /data/maker.json for older badges)")
         s.pack(fill="x", padx=6, pady=6)
         row = ctk.CTkFrame(s.body, fg_color="transparent")
         row.pack(fill="x", pady=2)
-        ctk.CTkLabel(row, text="Broadcast as:", width=110, anchor="w").pack(side="left")
-        bt = prof.get("broadcast_text")
-        if bt is None:
-            bt = ob.default_broadcast(prof.get("name", ""))
-        self.name_var = ctk.StringVar(value=bt)
-        ctk.CTkEntry(row, textvariable=self.name_var, width=220,
-                     placeholder_text="(empty = anonymous id only)").pack(side="left", padx=6)
-        self.counter = ctk.CTkLabel(row, text="", width=260, anchor="w")
-        self.counter.pack(side="left", padx=6)
+        ctk.CTkLabel(row, text="Maker handle:", width=110, anchor="w").pack(side="left")
+        self.handle_label = ctk.CTkLabel(row, text="", anchor="w", font=ctk.CTkFont(weight="bold"))
+        self.handle_label.pack(side="left", padx=6)
+        ctk.CTkButton(row, text="Edit in Settings \u2192 User Settings", width=230,
+                      command=self.edit_profile).pack(side="left", padx=10)
         row2 = ctk.CTkFrame(s.body, fg_color="transparent")
         row2.pack(fill="x", pady=2)
         ctk.CTkLabel(row2, text="What you make:", width=110, anchor="w").pack(side="left")
-        self.makes_var = ctk.StringVar(value=prof.get("makes", ""))
-        ctk.CTkEntry(row2, textvariable=self.makes_var, width=320,
-                     placeholder_text="e.g. robots, synths, badges (not broadcast)").pack(side="left", padx=6)
-        self.makes_counter = ctk.CTkLabel(row2, text="", width=160, anchor="w")
-        self.makes_counter.pack(side="left", padx=6)
-        self.name_var.trace_add("write", lambda *_: self._changed())
-        self.makes_var.trace_add("write", lambda *_: self._changed())
+        self.makes_label = ctk.CTkLabel(row2, text="", anchor="w")
+        self.makes_label.pack(side="left", padx=6)
+        self.bcast_label = ctk.CTkLabel(s.body, text="", anchor="w", justify="left", text_color=muted)
+        self.bcast_label.pack(fill="x", pady=(2, 0))
+        self.note_label = ctk.CTkLabel(s.body, text="", anchor="w", justify="left",
+                                       text_color=COLORS["warning_text"])
+        self.note_label.pack(fill="x")
         self.broadcast_var = ctk.BooleanVar(value=bool(prof.get("detector_enabled", True)))
-        ctk.CTkSwitch(s.body, text="Broadcast my presence (Maker Detector on)",
-                      variable=self.broadcast_var).pack(anchor="w", pady=4)
-        self.id_label = ctk.CTkLabel(s.body, text="Badge id: (not read yet)", anchor="w")
+        ctk.CTkSwitch(s.body, text="Broadcast my presence (Maker Detector on)", variable=self.broadcast_var,
+                      command=self._switch_changed).pack(anchor="w", pady=4)
+        self.id_label = ctk.CTkLabel(s.body, text="On the badge: (not read yet)", anchor="w", justify="left")
         self.id_label.pack(fill="x")
         btns = ctk.CTkFrame(s.body, fg_color="transparent")
         btns.pack(fill="x", pady=4)
         ctk.CTkButton(btns, text="Read from badge", command=self.read_from_badge).pack(side="left", padx=(0, 6))
-        self.write_btn = ctk.CTkButton(btns, text="Write to badge", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
-                                       command=self.write_to_badge)
+        self.write_btn = ctk.CTkButton(btns, text="Write to badge", fg_color=COLORS["danger"],
+                                       hover_color=COLORS["danger_hover"], command=self.write_to_badge)
         self.write_btn.pack(side="left", padx=6)
         self.apply_btn = ctk.CTkButton(btns, text="Write settings + install + restart",
                                        fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
@@ -163,30 +202,37 @@ class MakerTab(BaseTab):
         self.app_label.pack(fill="x")
         loc = self._local()
         self.local_label = ctk.CTkLabel(
-            a.body, anchor="w", justify="left", text_color="gray60",
+            a.body, anchor="w", justify="left", text_color=muted,
             text=f"Local file: {loc}" if loc else "Local file not found. Looked in:\n  " +
             "\n  ".join(str(p) for p in ob.local_app_candidates(self.ctx.config.get("repo_dir"))))
         self.local_label.pack(fill="x")
         b2 = ctk.CTkFrame(a.body, fg_color="transparent")
         b2.pack(fill="x", pady=4)
         ctk.CTkButton(b2, text="Check", width=80, command=self.check_app).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(b2, text="Install / update app", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self.install).pack(side="left", padx=6)
-        ctk.CTkLabel(a.body, anchor="w", justify="left", text_color="gray60", wraplength=1000,
+        self.install_btn = ctk.CTkButton(b2, text="Install / update app", fg_color=COLORS["danger"],
+                                         hover_color=COLORS["danger_hover"], command=self.install)
+        self.install_btn.pack(side="left", padx=6)
+        ctk.CTkLabel(a.body, anchor="w", justify="left", text_color=muted, wraplength=1000,
                      text="Installing checks that the app loads on the badge (it is removed again if not), "
                           "removes the old Nerd Detector (two detectors would both advertise), keeps your "
                           "badge id, then hard-resets the badge.").pack(fill="x")
 
         # ---- scan
-        sc = Section(scroll, "Scan from this Mac (optional)")
+        sc = Section(scroll, "Scan from this Mac (optional, experimental)")
         sc.pack(fill="x", padx=6, pady=6)
         if bleak_available():
-            self.scan_btn = ctk.CTkButton(sc.body, text=f"Scan ({SCAN_SECONDS} s)", command=self.scan)
+            self.scan_btn = ctk.CTkButton(sc.body, text=f"Scan from this Mac (experimental, {SCAN_SECONDS} s)",
+                                          command=self.scan)
             self.scan_btn.pack(anchor="w")
+            ctk.CTkLabel(sc.body, anchor="w", justify="left", text_color=muted, wraplength=1000,
+                         text="Runs in a separate helper process. macOS may refuse Bluetooth access to apps "
+                              "started from a terminal or IDE; a badge running Maker Detector always works.").pack(fill="x")
             self.scan_box = ctk.CTkTextbox(sc.body, height=140, font=ctk.CTkFont(family="Menlo", size=12))
             self.scan_box.pack(fill="x", pady=4)
             self.scan_box.configure(state="disabled")
         else:
             self.scan_btn = None
+            self.scan_box = None
             ctk.CTkLabel(sc.body, anchor="w", justify="left",
                          text="Needs the 'bleak' package. Install it with:\n    .venv/bin/pip install bleak\n"
                               "then restart the manager.").pack(fill="x")
@@ -196,81 +242,120 @@ class MakerTab(BaseTab):
         e.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(e.body, text=EXPLAINER, anchor="w", justify="left", wraplength=1000).pack(fill="x")
 
-        self._changed()
+        self.ctx.events.subscribe("profile.changed", lambda _p: self._reload_profile())
+        self._reload_profile()
 
-    # ------------------------------------------------------------ settings
-    def _changed(self) -> None:
-        name, makes = self.name_var.get(), self.makes_var.get()
-        err = validate_name(name)
-        merr = ob.validate_makes(makes)
-        self.counter.configure(text=err or f"{len(name)}/{MAX_NAME}  (public)",
-                               text_color="#d9534f" if err else "gray60")
-        self.makes_counter.configure(text=merr or f"{len(makes)}/{MAX_MAKES}",
-                                     text_color="#d9534f" if merr else "gray60")
-        state = "disabled" if (err or merr) else "normal"
+    # ------------------------------------------------------------ profile
+    def _handle(self) -> str:
+        return ob.profile_handle(ob.get_profile(self.ctx.config))
+
+    def _refresh_labels(self) -> None:
+        p = ob.get_profile(self.ctx.config)
+        h = ob.profile_handle(p)
+        self.handle_label.configure(text=h or "(not set)",
+                                    text_color=COLORS["text"] if h else COLORS["danger_text"])
+        self.makes_label.configure(text=p.get("makes") or "(not set)")
+        bt = ob.broadcast_text(h)
+        if not self.broadcast_var.get():
+            self.bcast_label.configure(text="Broadcasting is OFF: the badge only listens for others.")
+        elif bt.strip():
+            self.bcast_label.configure(text=f"Broadcast text (public): \"{bt}\"  + a random badge id")
+        else:
+            self.bcast_label.configure(text="Broadcast: the anonymous badge id only (no text)")
+        self.note_label.configure(text=ob.broadcast_note(h) if self.broadcast_var.get() else "")
+        state = "normal" if h else "disabled"
         self.write_btn.configure(state=state)
         self.apply_btn.configure(state=state)
 
+    def _reload_profile(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        p = ob.get_profile(self.ctx.config)
+        self.broadcast_var.set(bool(p.get("detector_enabled", True)))
+        self._refresh_labels()
+
+    def _switch_changed(self) -> None:
+        self._save_profile()
+        self._refresh_labels()
+
+    def _changed(self) -> None:   # old name
+        self._refresh_labels()
+
+    def edit_profile(self) -> None:
+        if not open_user_settings(self):
+            self.ctx.status("Edit your maker handle in Settings \u2192 User Settings")
+
     def _invalid(self) -> bool:
-        return bool(validate_name(self.name_var.get()) or ob.validate_makes(self.makes_var.get()))
+        return not self._handle()
 
     def _show_settings(self, d: dict) -> None:
+        """d = {"owner": owner.json, "maker": maker.json} as on the badge (either may be empty)."""
         if not d:
             return
-        if "name" in d:
-            self.name_var.set(str(d.get("name") or ""))
-        if "makes" in d:
-            self.makes_var.set(str(d.get("makes") or ""))
-        if "broadcast" in d:
-            self.broadcast_var.set(bool(d.get("broadcast")))
-        self.id_label.configure(text=f"Badge id: {d.get('id') or '(none yet; the badge creates one)'}")
+        o, m = d.get("owner") or {}, d.get("maker") or {}
+        if not o and not m:
+            self.id_label.configure(text="On the badge: no owner.json or maker.json yet")
+            return
+        handle = o.get("maker_handle") if "maker_handle" in o else m.get("display_name") or m.get("name")
+        bc = o.get("broadcast") if "broadcast" in o else m.get("broadcast")
+        bits = [f"handle \"{handle or ''}\"", "broadcast " + ("on" if bc else "off"),
+                f"id {m.get('id') or '(none yet; the badge creates one)'}"]
+        if not o:
+            bits.append("no owner.json yet (older setup)")
+        self.id_label.configure(text="On the badge: " + ", ".join(bits))
 
     def read_from_badge(self) -> None:
         def job():
-            d = ob.read_settings(self.ctx.badge)
-            if not d.get("id"):
-                bid = ob.existing_id(self.ctx.badge, d)
+            m = ob.read_settings(self.ctx.badge)
+            if not m.get("id"):
+                bid = ob.existing_id(self.ctx.badge, m)
                 if bid:
-                    d = dict(d, id=bid)
-            return d
+                    m = dict(m, id=bid)
+            return {"owner": ob.read_owner(self.ctx.badge), "maker": m}
 
         def done(d):
-            self.ctx.status("Read maker settings" if d else f"No {SETTINGS_PATH} on badge yet")
+            self.ctx.status("Read badge profile" if (d["owner"] or d["maker"]) else
+                            f"No {OWNER_PATH} or {SETTINGS_PATH} on the badge yet")
             self._show_settings(d)
-        self.ctx.run_device_task(job, done, title="Reading maker.json")
+        self.ctx.run_device_task(job, done, title="Reading badge profile")
 
     def _confirm_write(self, extra: str = "") -> bool:
-        name = self.name_var.get()
+        bt = ob.broadcast_text(self._handle())
         if self.broadcast_var.get():
-            what = (f"\"{name}\" and a random badge id" if name else "A random badge id (no text)")
+            what = (f"\"{bt}\" and a random badge id" if bt.strip() else "A random badge id (no text)")
             msg = (f"{what} will be broadcast publicly over Bluetooth to anyone nearby "
                    "(any phone or laptop can read it), until you switch broadcasting off.")
         else:
             msg = "Broadcasting will be OFF: the badge will only listen for others."
-        return confirm(self, "Write Maker Detector settings", msg + extra + "\n\nContinue?")
+        msg += (f"\n\nThis overwrites your profile in {OWNER_PATH} (other keys kept) and "
+                f"{SETTINGS_PATH} on the badge.")
+        return confirm(self, "Write badge profile", msg + extra + "\n\nContinue?")
 
     def _save_profile(self) -> dict:
-        """Store the form in config "profile" (Tk thread) and return it."""
-        p = ob.get_profile(self.ctx.config)
-        p.update({"broadcast_text": self.name_var.get(), "makes": ob.clean_makes(self.makes_var.get()),
-                  "detector_enabled": bool(self.broadcast_var.get())})
-        p.setdefault("name", "")
+        """Store the broadcast switch in config "profile" (Tk thread) and return the profile."""
+        p = ob.drop_legacy(ob.get_profile(self.ctx.config))
+        p["detector_enabled"] = bool(self.broadcast_var.get())
+        p.setdefault("maker_handle", "")
         p.setdefault("applied_to", [])
         self.ctx.config.set(ob.PROFILE_KEY, p)
+        self.ctx.events.publish("profile.changed", dict(p))
         return p
 
     def write_to_badge(self) -> None:
-        if self._invalid() or not self._confirm_write("\n\nThe app re-reads settings on restart."):
+        if self._invalid() or not self._confirm_write("\n\nApps re-read it on restart."):
             return
         p = self._save_profile()
-        name, makes, bc = p["broadcast_text"], p["makes"], p["detector_enabled"]
+        handle, makes, bc = ob.profile_handle(p), p.get("makes") or "", p["detector_enabled"]
 
         def done(d):
             self._show_settings(d)
-            self.ctx.events.publish("badge.files_changed", [SETTINGS_PATH])
-            self.ctx.status("Maker settings written (the app re-reads them on restart)")
-        self.ctx.run_device_task(lambda: ob.write_settings(self.ctx.badge, name, makes, bc), done,
-                                 title="Writing maker.json")
+            self.ctx.events.publish("badge.files_changed", [OWNER_PATH, SETTINGS_PATH])
+            self.ctx.status("Badge profile written (apps re-read it on restart)")
+        self.ctx.run_device_task(lambda: ob.write_settings(self.ctx.badge, handle, makes, bc), done,
+                                 title="Writing badge profile")
 
     def write_install_restart(self) -> None:
         if self._invalid():
@@ -283,6 +368,7 @@ class MakerTab(BaseTab):
         def done(res):
             self._show_settings(res.get("settings") or {})
             self.check_app()
+
         def failed(e):
             info(self, "Maker Detector failed", str(e))
             self.check_app()
@@ -295,12 +381,6 @@ class MakerTab(BaseTab):
             else:
                 self._reload_profile()
         wait(ob.maybe_run_onboarding(self.winfo_toplevel(), self.ctx, force=True))
-
-    def _reload_profile(self) -> None:
-        p = ob.get_profile(self.ctx.config)
-        self.name_var.set(p.get("broadcast_text") or "")
-        self.makes_var.set(p.get("makes") or "")
-        self.broadcast_var.set(bool(p.get("detector_enabled")))
 
     # ------------------------------------------------------------ app
     def on_show(self) -> None:
@@ -365,19 +445,33 @@ class MakerTab(BaseTab):
         self.ctx.run_device_task(job, done, failed, title="Installing Maker Detector")
 
     # ------------------------------------------------------------ scan
+    def _scan_text(self, text: str) -> None:
+        if self.scan_box is None:
+            return
+        self.scan_box.configure(state="normal")
+        self.scan_box.delete("1.0", "end")
+        self.scan_box.insert("1.0", text)
+        self.scan_box.configure(state="disabled")
+
     def scan(self) -> None:
-        self.scan_btn.configure(state="disabled")
+        """Scan in a child process (never bleak in this process: macOS may SIGABRT it)."""
+        if self.scan_btn is not None:
+            self.scan_btn.configure(state="disabled")
+        self._scan_text("Scanning...")
 
         def done(rows):
-            self.scan_btn.configure(state="normal")
+            if self.scan_btn is not None:
+                self.scan_btn.configure(state="normal")
             lines = [f"{'id':<8}{'rssi':>6}  name"] + [
-                f"{r['id']:<8}{r['rssi'] if r['rssi'] is not None else '?':>6}  {r['name'] or '(anonymous)'}"
-                for r in rows] if rows else ["No Maker Detector badges found."]
-            self.scan_box.configure(state="normal")
-            self.scan_box.delete("1.0", "end")
-            self.scan_box.insert("1.0", "\n".join(lines))
-            self.scan_box.configure(state="disabled")
+                f"{r.get('id', '?'):<8}{r['rssi'] if r.get('rssi') is not None else '?':>6}  "
+                f"{r.get('name') or '(anonymous)'}" for r in rows] if rows else ["No Maker Detector badges found."]
+            self._scan_text("\n".join(lines))
             self.ctx.status(f"Scan done: {len(rows)} maker(s)")
 
-        self.ctx.run_task(scan_makers, done, lambda _e: self.scan_btn.configure(state="normal"),
-                          title="BLE scan")
+        def failed(e):
+            if self.scan_btn is not None:
+                self.scan_btn.configure(state="normal")
+            self._scan_text(str(e))
+            self.ctx.status("Bluetooth blocked by macOS" if isinstance(e, ScanBlocked) else "Bluetooth scan failed")
+
+        self.ctx.run_task(lambda: run_scan(SCAN_SECONDS), done, failed, title="BLE scan")

@@ -4,18 +4,32 @@ Badge facts this relies on (see firmware/badge/lib/app_switcher.py):
   * Every /apps/*.py whose name does not start with "_" is imported at boot (except base_app,
     template, __init__) and every BaseApp subclass in it becomes an LED-menu entry.
   * So disabling an app non-destructively = rename /apps/foo.py -> /apps/_foo.py (and back).
-  * Menu order is alphabetical by module name, then class order inside the module.
+  * Menu order comes from dir() of a generated module, so it is effectively arbitrary; the switcher
+    writes the real order at every boot to /data/app_list (btree: bytes([slot]) -> app .name).
+    Read with exec_py (read_app_list); missing -> alphabetical estimate marked "≈".
+  * 8 LEDs per page: slots 1-8 orange, 9-16 cyan, 17-24 magenta.
   * Changes take effect after a HARD reset (never soft reset: LVGL does not survive it).
 
+"Start at boot" (resume-last-app firmware change, lib/app_switcher.py):
+  * /data/last_app.json {"module": "<file stem>", "app": "<BaseApp .name>"}: written by the badge
+    when an app is launched from the menu; at boot that app starts instead of the menu.
+  * /data/boot.json {"resume": false} turns that off (missing file / key = on). Read at boot.
+    Writing either file goes through mpremote, which pauses the badge UI, so every boot-setting
+    write ends with a hard reset (in a finally). Menu+/Menu- held at boot = menu.
+  * Supported if /lib/app_switcher.py on the badge mentions "last_app.json".
+
 The pure helpers at module level (scan_badge, set_enabled, remove_app, build_install_plan,
-execute_plan, menu_positions) take a badge service / source trees as arguments so they can be
+execute_plan, menu_positions, read_app_list, parse_app_list, read_boot_state, write_boot_resume,
+write_last_app, write_boot_and_reset) take a badge service / source trees as arguments so they can be
 tested against FakeBadgeService without the UI.
 """
 
 from __future__ import annotations
 
+import ast
 import datetime
 import hashlib
+import json
 import re
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -39,6 +53,10 @@ MENU_DENY = {"__init__", "base_app", "template"}
 CORE_FILES = {"lib/epd.py", "lib/button.py", "lib/led_bar.py", "lib/app_switcher.py", "main.py",
               "apps/base_app.py"}
 NUM_LEDS = 8
+BOOT_PATH = "/data/boot.json"
+LAST_APP_PATH = "/data/last_app.json"
+SWITCHER_PATH = "/lib/app_switcher.py"
+RESUME_MARKER = b"last_app.json"
 
 
 def sha256(data: bytes) -> str:
@@ -61,6 +79,27 @@ def concrete_classes(src: str, classes: list[str]) -> list[str]:
         if m and re.search(r"^\s+_abstract\s*=\s*True", m.group(0), re.M):
             continue
         out.append(c)
+    return out
+
+
+def app_names(src: str, classes: list[str]) -> list[tuple[str, str, bool]]:
+    """Best guess of each class's runtime BaseApp .name (what last_app.json stores as "app"):
+    [(class, name, sure)]. Uses a literal `self.name = "..."` or `super().__init__("...")` in the class
+    body, else the class name (BaseApp's default). sure=False when the body computes the name."""
+    out = []
+    for c in classes:
+        m = re.search(rf"^class\s+{c}\b.*?(?=^\S|\Z)", src, re.M | re.S)
+        body = m.group(0) if m else ""
+        lit = re.findall(r"self\.name\s*=\s*([\"'])(.*?)\1\s*$", body, re.M)
+        if lit:
+            out.append((c, lit[-1][1], True))
+            continue
+        sup = re.findall(r"super\(\)\.__init__\(\s*(?:name\s*=\s*)?([\"'])(.*?)\1", body)
+        computed = bool(re.search(r"self\.name\s*=", body)) or bool(re.search(r"super\(\)\.__init__\(\s*\w", body))
+        if sup and not re.search(r"self\.name\s*=", body):
+            out.append((c, sup[-1][1], True))
+        else:
+            out.append((c, c, not computed))
     return out
 
 
@@ -198,7 +237,8 @@ class BadgeApp:
     classes: list[str] = field(default_factory=list)
     lib_deps: list[str] = field(default_factory=list)
     data_refs: list[str] = field(default_factory=list)
-    menu: str = ""      # "#3" / "#3-4" / ""
+    menu: str = ""      # "3 (orange 3)" / "9-10 (cyan 1-2)" / "≈3 (orange 3)" / "after restart" / ""
+    names: list[tuple[str, str, bool]] = field(default_factory=list)   # app_names()
 
 
 @dataclass
@@ -207,28 +247,122 @@ class BadgeState:
     hashes: dict[str, str]       # "/apps/x.py" / "/lib/y.py" -> sha256
     paths: set[str]              # every known badge path (apps, lib, data, root entries)
     menu_count: int = 0
+    boot: dict | None = None     # read_boot_state()
+    app_list: list[str] | None = None   # read_app_list(); None = menu order only estimated
 
     def app(self, path: str) -> BadgeApp | None:
         return next((a for a in self.apps if a.path == path), None)
 
 
-def menu_positions(apps: list[BadgeApp]) -> int:
-    """Fill BadgeApp.menu for enabled apps (alphabetical module order, then class order)."""
-    pos = 0
-    for a in sorted(apps, key=lambda a: Path(a.path).stem):
+LED_PAGES = ("orange", "cyan", "magenta")   # LED-bar colour per page of 8 menu slots
+APP_LIST_PATH = "/data/app_list"
+APP_LIST_CODE = (
+    "try:\n"
+    " import btree\n"
+    " f=open('/data/app_list','r+b'); db=btree.open(f)\n"
+    " print('SLOTS', [(k[0], db[k].decode()) for k in db]); db.close(); f.close()\n"
+    "except Exception as e:\n"
+    " print('SLOTS NONE', repr(e))\n")
+
+
+def parse_app_list(out: str | None) -> list[str] | None:
+    """exec_py output of APP_LIST_CODE -> app names by 0-based slot, or None (missing / unreadable)."""
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("SLOTS ") or line.startswith("SLOTS NONE"):
+            continue
+        try:
+            pairs = ast.literal_eval(line[len("SLOTS "):])
+            slots = {int(k): str(v) for k, v in pairs}
+        except (ValueError, SyntaxError, TypeError):
+            return None
+        return [slots[k] for k in sorted(slots)] if slots else None
+    return None
+
+
+def read_app_list(badge) -> list[str] | None:
+    """Blocking. The real LED-menu order the badge's app_switcher wrote at its last boot, or None."""
+    try:
+        return parse_app_list(badge.exec_py(APP_LIST_CODE, timeout=20))
+    except Exception:  # noqa: BLE001  (old firmware / fake badge / read error -> estimate)
+        return None
+
+
+def led_label(slot: int) -> str:
+    """1-based menu slot -> "9 (cyan 1)": LED number within its page and the page colour."""
+    page, led = divmod(slot - 1, NUM_LEDS)
+    colour = LED_PAGES[page] if page < len(LED_PAGES) else f"page {page + 1}"
+    return f"{slot} ({colour} {led + 1})"
+
+
+def _slots_label(slots: list[int], prefix: str = "") -> str:
+    if not slots:
+        return ""
+    if len(slots) > 1 and slots == list(range(slots[0], slots[0] + len(slots))) \
+            and (slots[0] - 1) // NUM_LEDS == (slots[-1] - 1) // NUM_LEDS:
+        page, led = divmod(slots[0] - 1, NUM_LEDS)
+        colour = LED_PAGES[page] if page < len(LED_PAGES) else f"page {page + 1}"
+        return f"{prefix}{slots[0]}-{slots[-1]} ({colour} {led + 1}-{led + len(slots)})"
+    return ", ".join(prefix + led_label(n) for n in slots)
+
+
+def _menu_apps(apps: list[BadgeApp]) -> list[BadgeApp]:
+    out = []
+    for a in apps:
         a.menu = ""
         if not a.enabled or a.core or Path(a.path).stem in MENU_DENY:
             continue
-        n = len(a.classes)
-        if n == 0:
+        if not a.classes:
             a.menu = "none"
             continue
-        a.menu = f"#{pos + 1}" if n == 1 else f"#{pos + 1}-{pos + n}"
-        pos += n
-    return pos
+        out.append(a)
+    return out
 
 
-def scan_badge(badge, content_cache: dict[str, bytes]) -> BadgeState:
+def menu_positions(apps: list[BadgeApp], app_list: list[str] | None = None) -> int:
+    """Fill BadgeApp.menu for enabled apps. Returns the number of menu entries.
+
+    app_list (read_app_list(): the names the switcher stored at the last boot, by slot) gives the real
+    order; apps are matched by their runtime .name (app_names() guesses). Apps with no slot were added
+    or enabled since that boot: "after restart". Without app_list the order is only estimated
+    (alphabetical module order, then class order) and marked with "≈"."""
+    menu = _menu_apps(apps)
+    if app_list is None:
+        pos = 0
+        for a in sorted(menu, key=lambda a: Path(a.path).stem):
+            n = len(a.classes)
+            a.menu = _slots_label(list(range(pos + 1, pos + n + 1)), "≈")
+            pos += n
+        return pos
+    free = {i: name for i, name in enumerate(app_list)}
+    found: dict[tuple[str, int], int] = {}     # (path, class index) -> 1-based slot
+    wanted = [(a, i, (a.names[i] if i < len(a.names) else (c, c, False)))
+              for a in sorted(menu, key=lambda a: Path(a.path).stem) for i, c in enumerate(a.classes)]
+    # pass 1: exact name; pass 2: computed names (e.g. "Sat Talks" for class Talks) by substring
+    def norm(x: str) -> str:
+        return re.sub(r"[\W_]", "", x).lower()
+    for exact in (True, False):
+        # most specific guesses first, so class Talks doesn't take "Sun Talks" from class SunTalks
+        for a, i, (cls, name, sure) in sorted(wanted, key=lambda w: -len(w[2][1])) if not exact else wanted:
+            if (a.path, i) in found or (not exact and sure):
+                continue
+            for k in sorted(free):
+                v = free[k]
+                if (v == name) if exact else (norm(name) in norm(v) or norm(cls) in norm(v)):
+                    found[(a.path, i)] = k + 1
+                    del free[k]
+                    break
+    for a in menu:
+        slots = sorted(found[(a.path, i)] for i in range(len(a.classes)) if (a.path, i) in found)
+        missing = len(a.classes) - len(slots)
+        label = _slots_label(slots)
+        if missing:
+            label = (label + f"; +{missing} after restart") if label else "after restart"
+        a.menu = label
+    return len(app_list)
+
+
+def scan_badge(badge, content_cache: dict[str, bytes], read_slots: bool = True) -> BadgeState:
     """Blocking (device thread). content_cache maps sha256 -> file bytes to avoid re-reading."""
     entries = badge.listdir("/apps")
     hashes: dict[str, str] = {}
@@ -262,11 +396,81 @@ def scan_badge(badge, content_cache: dict[str, bytes]) -> BadgeState:
             info = parse_app(data.decode(errors="replace"), ref="badge", path=e.path)
             a.title, a.lib_deps, a.data_refs = info.title, info.lib_deps, info.data_refs
             a.classes = concrete_classes(data.decode(errors="replace"), info.classes)
+            a.names = app_names(data.decode(errors="replace"), a.classes)
         apps.append(a)
     st = BadgeState(apps, hashes, paths)
-    st.menu_count = menu_positions(apps)
+    st.app_list = read_app_list(badge) if read_slots else None
+    st.menu_count = menu_positions(apps, st.app_list)
     apps.sort(key=lambda a: (a.core, Path(a.path).stem.lstrip("_")))
     return st
+
+
+def _read_json_file(badge, path: str) -> dict:
+    try:
+        if not badge.exists(path):
+            return {}
+        d = json.loads(badge.read_file(path).decode("utf-8"))
+    except Exception:  # noqa: BLE001  (missing / invalid)
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def read_boot_state(badge) -> dict:
+    """Blocking. {"supported": bool, "resume": bool, "last": {"module","app"} | None,
+    "boot": boot.json dict}."""
+    try:
+        supported = RESUME_MARKER in badge.read_file(SWITCHER_PATH)
+    except Exception:  # noqa: BLE001  (no such file / read error)
+        supported = False
+    boot = _read_json_file(badge, BOOT_PATH)
+    last = _read_json_file(badge, LAST_APP_PATH)
+    if not (isinstance(last.get("module"), str) and isinstance(last.get("app"), str)):
+        last = None
+    return {"supported": supported, "resume": boot.get("resume", True) is not False,
+            "last": last, "boot": boot}
+
+
+def write_boot_resume(badge, resume: bool) -> dict:
+    """Read-modify-write /data/boot.json {"resume": bool}, other keys kept. Returns the new dict."""
+    d = _read_json_file(badge, BOOT_PATH)
+    d["resume"] = bool(resume)
+    badge.write_bytes(json.dumps(d).encode(), BOOT_PATH)
+    return d
+
+
+def write_boot_and_reset(badge, write) -> dict:
+    """Blocking: write() then read the boot state back, ALWAYS ending with a hard reset (every
+    mpremote command pauses the badge UI until one). Returns the state read before the reset."""
+    try:
+        write()
+        return read_boot_state(badge)
+    finally:
+        badge.reset()
+
+
+def write_last_app(badge, module: str, app: str) -> dict:
+    """Overwrite /data/last_app.json (the app the badge starts at the next boot if resume is on)."""
+    d = {"module": module, "app": app}
+    badge.write_bytes(json.dumps(d).encode(), LAST_APP_PATH)
+    return d
+
+
+def boot_status_text(boot: dict | None, state: "BadgeState | None" = None) -> str:
+    if not boot:
+        return "Start at boot: (badge not read)"
+    if not boot.get("supported"):
+        return "Badge firmware doesn't support resume yet (it always starts in the menu)."
+    if not boot.get("resume"):
+        return "Starts at boot: menu"
+    last = boot.get("last")
+    if not last:
+        return "Starts at boot: last used app (none saved yet, so the menu)"
+    txt = f"Starts at boot: last used app (currently {last['app']}, from {last['module']}.py)"
+    if state is not None:
+        a = next((x for x in state.apps if x.module == last["module"] and x.enabled and not x.core), None)
+        if a is None:
+            txt += "; that app is not enabled on the badge, so it will show the menu"
+    return txt
 
 
 def set_enabled(badge, app_path: str, enable: bool) -> str:
@@ -525,6 +729,8 @@ class AppsTab(BaseTab):
                                        text_color=COLORS["muted_text"])
         self.apply_note.pack(side="right", padx=8)
 
+        self._build_boot()
+
         panes = ctk.CTkFrame(self, fg_color="transparent")
         panes.pack(fill="both", expand=True)
         panes.grid_columnconfigure(0, weight=5, uniform="p")
@@ -540,7 +746,7 @@ class AppsTab(BaseTab):
         tf.pack(fill="both", expand=True, pady=4)
         self.btree = ttk.Treeview(tf, columns=("menu", "module", "title", "state", "size"), show="headings",
                                   selectmode="browse")
-        for col, text, w, st in (("menu", "LED", 55, False), ("module", "Module", 120, False),
+        for col, text, w, st in (("menu", "LED", 120, False), ("module", "Module", 120, False),
                                  ("title", "Title", 200, True), ("state", "State", 80, False),
                                  ("size", "Size", 70, False)):
             self.btree.heading(col, text=text, anchor="w")
@@ -564,6 +770,12 @@ class AppsTab(BaseTab):
         self.bsrc_btn = ctk.CTkButton(row, text="Open source", width=100, command=self.open_badge_source,
                                       state="disabled")
         self.bsrc_btn.pack(side="left", padx=4)
+        self.bootapp_menu = ctk.CTkOptionMenu(row, values=["-"], width=150)
+        self.bootapp_btn = ctk.CTkButton(row, text="Set as boot app…", width=130, fg_color=COLORS["danger"],
+                                         hover_color=COLORS["danger_hover"], command=self.set_boot_app,
+                                         state="disabled")
+        self.bootapp_btn.pack(side="right", padx=(4, 0))
+        self.bootapp_menu.pack(side="right", padx=4)
 
         # ---- right: available
         right = Section(panes, "Available (all forks/branches + local folders)")
@@ -639,13 +851,20 @@ class AppsTab(BaseTab):
         self._badge_busy = True
         self.badge_info.configure(text="Reading /apps from the badge…")
         badge, cache = self.ctx.badge, self._content
-        self.ctx.run_device_task(lambda: scan_badge(badge, cache), self._badge_done, self._badge_failed,
-                                 title="Reading badge apps")
+        def job():
+            st = scan_badge(badge, cache)
+            try:
+                st.boot = read_boot_state(badge)
+            except Exception as e:  # noqa: BLE001  (never let this break the app list)
+                self.ctx.log(f"Start at boot: could not read boot settings: {e}")
+            return st
+        self.ctx.run_device_task(job, self._badge_done, self._badge_failed, title="Reading badge apps")
 
     def _badge_done(self, state: BadgeState) -> None:
         self._badge_busy = False
         self.state = state
         self._fill_badge()
+        self._show_boot(state.boot)
         self._fill_catalog()
         if self._badge_again:
             self._badge_again = False
@@ -659,6 +878,7 @@ class AppsTab(BaseTab):
         self.state = None
         self.btree.delete(*self.btree.get_children())
         self.badge_info.configure(text=msg)
+        self._show_boot(None)
         self._badge_selected()
         self._fill_catalog()
 
@@ -679,8 +899,14 @@ class AppsTab(BaseTab):
                 self.btree.selection_set(a.path)
         n_en = sum(1 for a in st.apps if a.enabled and not a.core)
         n_dis = sum(1 for a in st.apps if not a.enabled and not a.core)
-        extra = f"  (more than {NUM_LEDS} LEDs: the menu wraps)" if st.menu_count > NUM_LEDS else ""
-        self.badge_info.configure(text=f"{n_en} enabled, {n_dis} disabled · {st.menu_count} menu entries{extra}")
+        extra = (f"  (more than {NUM_LEDS} LEDs: pages orange/cyan/magenta)"
+                 if st.menu_count > NUM_LEDS else "")
+        order = ("order from the badge's last boot" if st.app_list is not None
+                 else "≈ estimated order (badge has no /data/app_list)")
+        pending = any("after restart" in a.menu for a in st.apps)
+        self.badge_info.configure(
+            text=f"{n_en} enabled, {n_dis} disabled · {st.menu_count} menu entries{extra} · {order}"
+                 + ("; restart to give new apps a slot" if pending else ""))
         self._badge_selected()
 
     def _selected_badge_app(self) -> BadgeApp | None:
@@ -693,6 +919,7 @@ class AppsTab(BaseTab):
         for b in (self.toggle_btn, self.remove_btn):
             b.configure(state="normal" if usable else "disabled")
         self.bsrc_btn.configure(state="normal" if a else "disabled")
+        self._update_bootapp(a)
         if not a:
             self.badge_detail.configure(text="")
             return
@@ -710,6 +937,125 @@ class AppsTab(BaseTab):
         if not a.enabled:
             lines.append(f"Disabled (file starts with '_'); Enable renames it to {a.module}.py.")
         self.badge_detail.configure(text="\n".join(lines))
+
+    # ================================================================ start at boot
+    def _build_boot(self) -> None:
+        sec = Section(self, "Start at boot")
+        sec.pack(fill="x", padx=4, pady=(0, 6))
+        row = ctk.CTkFrame(sec.body, fg_color="transparent")
+        row.pack(fill="x")
+        self.boot_label = ctk.CTkLabel(row, text="Start at boot: (badge not read)", anchor="w")
+        self.boot_label.pack(side="left")
+        self.boot_save_btn = ctk.CTkButton(row, text="Save boot setting", width=150, fg_color=COLORS["danger"],
+                                           hover_color=COLORS["danger_hover"], command=self.save_boot_resume,
+                                           state="disabled")
+        self.boot_save_btn.pack(side="right", padx=4)
+        self.boot_var = ctk.BooleanVar(value=True)
+        self.boot_switch = ctk.CTkSwitch(row, text="Resume last app at boot", variable=self.boot_var,
+                                         command=self._boot_switch_changed, state="disabled")
+        self.boot_switch.pack(side="right", padx=8)
+        self.boot_note = ctk.CTkLabel(sec.body, text="", anchor="w", justify="left", text_color=COLORS["muted_text"])
+        self.boot_note.pack(fill="x")
+        self._boot: dict | None = None
+
+    def _show_boot(self, boot: dict | None) -> None:
+        self._boot = boot
+        self.boot_label.configure(text=boot_status_text(boot, self.state))
+        ok = bool(boot and boot.get("supported"))
+        self.boot_switch.configure(state="normal" if ok else "disabled")
+        if boot:
+            self.boot_var.set(bool(boot.get("resume", True)))
+        if ok:
+            note = ("Hold Menu+ or Menu\u2212 while the badge boots to get the menu anyway. Saving restarts "
+                    "the badge (hard reset) so the setting applies.")
+        elif boot:
+            note = (f"Needs the resume-last-app firmware change ({SWITCHER_PATH} that saves "
+                    f"{LAST_APP_PATH}); see the Firmware tab.")
+        else:
+            note = ""
+        self.boot_note.configure(text=note)
+        self._boot_switch_changed()
+        self._update_bootapp(self._selected_badge_app())
+
+    def _boot_switch_changed(self) -> None:
+        b = self._boot
+        differs = bool(b and b.get("supported") and bool(self.boot_var.get()) != bool(b.get("resume", True)))
+        self.boot_save_btn.configure(state="normal" if differs else "disabled")
+
+    def save_boot_resume(self) -> None:
+        b = self._boot
+        if not (b and b.get("supported")):
+            return
+        resume = bool(self.boot_var.get())
+        if not messagebox.askyesno(
+                "Start at boot",
+                f"Overwrite {BOOT_PATH} on the badge with \"resume\": {str(resume).lower()} (other keys kept)?\n\n"
+                + ("The badge will start the last app you used." if resume else
+                   "The badge will always start in the menu.")
+                + "\n\nThe badge will restart (hard reset) to apply it.", parent=self):
+            self.boot_var.set(bool(b.get("resume", True)))
+            self._boot_switch_changed()
+            return
+        badge = self.ctx.badge
+
+        def job():
+            return write_boot_and_reset(badge, lambda: write_boot_resume(badge, resume))
+
+        def done(boot):
+            if self.state is not None:
+                self.state.boot = boot
+            self._show_boot(boot)
+            self._restarted()
+            msg = f"Saved {BOOT_PATH}: resume {'on' if resume else 'off'}; badge restarting"
+            self.ctx.status(msg)
+            self.ctx.log(msg)
+        self.ctx.run_device_task(job, done, lambda e: messagebox.showerror("Start at boot", str(e), parent=self),
+                                 title="Saving boot setting")
+
+    def _update_bootapp(self, a) -> None:
+        if not hasattr(self, "bootapp_btn"):
+            return
+        names = [n for _c, n, _sure in (a.names if a else [])]
+        usable = bool(a and not a.core and a.enabled and names and self._boot and self._boot.get("supported"))
+        cur = self.bootapp_menu.get()
+        self.bootapp_menu.configure(values=names or ["-"])
+        self.bootapp_menu.set(cur if cur in names else (names[0] if names else "-"))
+        self.bootapp_menu.configure(state="normal" if usable and len(names) > 1 else "disabled")
+        self.bootapp_btn.configure(state="normal" if usable else "disabled")
+
+    def set_boot_app(self) -> None:
+        a = self._selected_badge_app()
+        b = self._boot
+        if not a or a.core or not a.enabled or not (b and b.get("supported")) or not a.names:
+            return
+        name = self.bootapp_menu.get()
+        entry = next((x for x in a.names if x[1] == name), a.names[0])
+        name, sure = entry[1], entry[2]
+        msg = (f"Overwrite {LAST_APP_PATH} on the badge with\n  module: {a.module}\n  app: {name}\n\n"
+               f"The badge will restart (hard reset) and then starts {name}. Launching another app "
+               "from the menu replaces it again.")
+        if not sure:
+            msg += ("\n\nNote: this app sets its name at runtime; if \"" + name + "\" isn't its real name the "
+                    "badge simply shows the menu.")
+        if not b.get("resume", True):
+            msg += "\n\n\"Resume last app at boot\" is OFF, so this has no effect until you switch it on."
+        if not messagebox.askyesno("Set as boot app", msg + "\n\nContinue?", parent=self):
+            return
+        badge, module = self.ctx.badge, a.module
+
+        def job():
+            return write_boot_and_reset(badge, lambda: write_last_app(badge, module, name))
+
+        def done(boot):
+            if self.state is not None:
+                self.state.boot = boot
+            self._show_boot(boot)
+            self._restarted()
+            msg = f"Boot app set to {name} ({module}.py); badge restarting"
+            self.ctx.status(msg)
+            self.ctx.log(msg)
+        self.ctx.run_device_task(job, done, lambda e: messagebox.showerror("Set as boot app", str(e), parent=self),
+                                 title="Setting boot app")
 
     def toggle_selected(self) -> None:
         a = self._selected_badge_app()
@@ -767,12 +1113,16 @@ class AppsTab(BaseTab):
         self.ctx.log(msg)
         self.ctx.events.publish("badge.files_changed", paths)
 
+    def _restarted(self) -> None:
+        """After any hard reset: pending app changes are applied by the reboot."""
+        self._dirty = False
+        self.apply_btn.configure(fg_color=COLORS["neutral"], hover_color=COLORS["neutral_hover"])
+        self.apply_note.configure(text="Badge restarted; new apps are in the LED menu once it boots.",
+                                  text_color=COLORS["muted_text"])
+
     def apply_restart(self) -> None:
         def done(_):
-            self._dirty = False
-            self.apply_btn.configure(fg_color=COLORS["neutral"], hover_color=COLORS["neutral_hover"])
-            self.apply_note.configure(text="Badge restarted; new apps are in the LED menu once it boots.",
-                                      text_color=COLORS["muted_text"])
+            self._restarted()
             self.ctx.status("Badge restarting (hard reset)")
         self.ctx.run_device_task(self.ctx.badge.reset, done, title="Hard reset")
 

@@ -27,7 +27,10 @@ ART_DIR = "/data/artwork"
 GALLERY_DIR = "/data/gallery"
 INDEX_FILE = "/data/artwork_index"
 BADGE_APP = "/apps/artwork.py"
-LOCAL_APP = Path(__file__).resolve().parents[2] / "artwork_app" / "badge" / "apps" / "artwork.py"
+# Desktop workspace layout first, then the git repo layout (<repo>/user_apps/artwork/apps/artwork.py).
+_ART_CANDIDATES = [Path(__file__).resolve().parents[2] / "artwork_app" / "badge" / "apps" / "artwork.py",
+                   Path(__file__).resolve().parents[3] / "user_apps" / "artwork" / "apps" / "artwork.py"]
+LOCAL_APP = next((c for c in _ART_CANDIDATES if c.exists()), _ART_CANDIDATES[-1])
 
 THUMB = (176, 123)          # 960x672 scaled
 PREVIEW = (336, 235)

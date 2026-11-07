@@ -165,7 +165,7 @@ class App(ctk.CTk):
         self.log_box.pack(fill="x", padx=4, pady=(0, 4))
         self._tab_changed()
 
-        # First-run wizard (name, what you make, Maker Detector); also offers the profile
+        # First-run wizard (maker handle, what you make, Maker Detector); also offers the profile
         # to badges as they connect.
         from core.onboarding import maybe_run_onboarding
         self.after(400, lambda: maybe_run_onboarding(self, self.ctx))

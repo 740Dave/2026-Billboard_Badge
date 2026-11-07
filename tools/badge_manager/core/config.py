@@ -56,6 +56,18 @@ class Config:
                     self.save()
                 except OSError:
                     pass
+        p = self.data.get("profile")
+        if isinstance(p, dict) and "name" in p and "maker_handle" not in p:
+            # Profiles before the owner.json change stored the handle as "name". Move it once;
+            # every other key (incl. legacy display_name / broadcast_text) is kept as is.
+            p = dict(p)
+            p["maker_handle"] = p.pop("name")
+            self.data["profile"] = p
+            if self.path.exists():
+                try:
+                    self.save()
+                except OSError:
+                    pass
 
     def get(self, key, default=None):
         return self.data.get(key, DEFAULTS.get(key, default))

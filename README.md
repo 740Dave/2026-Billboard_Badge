@@ -1,3 +1,59 @@
+# About this fork
+
+Community tools and apps for the Supercon 2026 Billboard Badge by [740Dave](https://github.com/740Dave), built at Supercon 2026. Hackaday's original README follows below, unchanged.
+
+## What's here
+
+| Path | What it is |
+|---|---|
+| [`tools/badge_manager`](tools/badge_manager) | Desktop GUI for the badge over USB: Device, Firmware, Apps, Artwork, Maker Detector and Settings tabs. Dark UI, polls the community forks for updates every 15 minutes, first-run setup |
+| [`tools/back_cover`](tools/back_cover) | Printable snap-on back cover. Tested on a Prusa XL in PLA, 0.20 mm layers, no supports |
+| [`user_apps/maker_detector`](user_apps/maker_detector) | BLE badge finder: counts other badges nearby and shows their handles |
+| [`user_apps/maker_tag`](user_apps/maker_tag) | Two-column "HELLO, I AM / I MAKE" name tag |
+| [`user_apps/artwork`](user_apps/artwork) | Show your own images on the badge; rotates every 5 minutes |
+| [`user_apps/sao_blink`](user_apps/sao_blink) | SAO blink example, plus an ESP32 SAO example ([`esp32_sao_blinker`](user_apps/sao_blink/esp32_sao_blinker)) |
+| [`docs/community_guide.md`](docs/community_guide.md) | Community guide |
+
+## Upstream proposals
+
+Each one is independent unless noted.
+
+- [#17 Printable back cover](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/17)
+- [#18 Resume the last app at boot](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/18)
+- [#19 Owner profile + Nametag handle](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/19)
+- [#20 App grid launcher](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/20) (builds on #18)
+- BLE presence (opt-in): coming soon
+
+## Branches
+
+- `main` mirrors Hack-a-Day/main.
+- `badge-manager` (default) has everything above.
+- The PR branches are kept clean for upstream.
+
+## Personalizing a badge by hand
+
+Create `/data/owner.json` on the badge:
+
+```json
+{"maker_handle": "your-handle", "makes": "what you make"}
+```
+
+Use a handle, not your legal name. Edit it over USB with [mpremote](https://docs.micropython.org/en/latest/reference/mpremote.html), [Thonny](https://thonny.org) or [viper-ide.org](https://viper-ide.org).
+
+## Badge Manager quick start
+
+```bash
+cd tools/badge_manager
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py                 # with a badge plugged in
+BADGE_FAKE=1 .venv/bin/python app.py    # try it without a badge
+```
+
+Built with [Claude Code](https://claude.com/claude-code).
+
+---
+
 ![Billboard_Badge](assets/frame_graphic_demo.png "2026 Hackaday Supercon Billboard Badge")
 
 # Badge Hardware

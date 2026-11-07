@@ -1,20 +1,27 @@
-"""First-run onboarding wizard + applying the user's profile (Maker Detector) to a badge.
+"""First-run onboarding wizard + applying the user's profile (owner.json, Maker Detector) to a badge.
 
 Public API:
     maybe_run_onboarding(root, ctx, force=False)
         Shows the modal wizard if config "profile" lacks onboarded=True (or force). Always (once per
         ctx) subscribes to "badge.connected" so a newly connected badge gets offered the profile.
     apply_profile_to_badge(ctx, profile, on_done=None, on_error=None)
-        Install/update Maker Detector + write /data/maker.json (or switch broadcasting off), then
-        HARD reset. Runs on ctx.run_device_task. Reused by tabs/maker.py.
+        Write /data/owner.json (+ keep /data/maker.json in sync), install/update Maker Detector if the
+        profile has it on, then HARD reset. Runs on ctx.run_device_task. Reused by tabs/maker.py and
+        Settings > User Settings.
 
 Config key "profile":
-    {"name": str, "makes": str (<=40), "detector_enabled": bool,
-     "broadcast_text": str (<=16 printable ASCII), "onboarded": bool,
+    {"maker_handle": str (<=60, a handle, not a legal name), "makes": str (<=64),
+     "detector_enabled": bool (= broadcast), "onboarded": bool,
      "applied_to": [machine.unique_id hex, ...]}   badges already offered/applied (never re-prompted)
+    Older configs stored the handle as "name" (core.config migrates it once). Legacy keys
+    "display_name" / "broadcast_text" are ignored and dropped on the next write.
 
-Badge side: /apps/maker_detector.py reads /data/maker.json =
-    {"id": "<6 hex>", "name": "<broadcast text>", "makes": "<local only>", "broadcast": bool}
+Badge side:
+    /data/owner.json  {"maker_handle", "makes", "broadcast", ...other keys preserved}
+                      read by lib/owner.py, nametag, Maker Tag, lib/presence.py (PR 2/3)
+    /data/maker.json  {"id": "<6 hex>", "name": "<broadcast text>", "makes", "broadcast", ...}
+                      legacy file for badges running an older Maker Detector; id is preserved
+    Broadcast text = maker_handle reduced to printable ASCII, clipped to 16 (same as lib/presence.py).
 The badge app migrates /data/nerd.json itself; we also carry the old id over when writing.
 
 Pure helpers below take a badge service (BadgeService or FakeBadgeService) as argument.
@@ -29,13 +36,18 @@ from pathlib import Path
 import customtkinter as ctk
 
 PROFILE_KEY = "profile"
+OWNER_PATH = "/data/owner.json"
 SETTINGS_PATH = "/data/maker.json"
 OLD_SETTINGS_PATH = "/data/nerd.json"
 BADGE_APP_PATH = "/apps/maker_detector.py"
 OLD_APP_PATH = "/apps/nerd_detector.py"
 MAX_BROADCAST = 16
-MAX_MAKES = 40
-MAX_NAME = 60
+MAX_MAKES = 64
+MAX_NAME = 60          # max maker handle length
+MAX_HANDLE = MAX_NAME
+LEGACY_PROFILE_KEYS = ("name", "display_name", "broadcast_text")
+HANDLE_HINT = ("a nickname or handle \u2014 not your legal name; it's shown on your badge and may be "
+               "broadcast publicly")
 VALIDATE_CODE = ("import apps.maker_detector as m; a = m.MakerDetectorApp(); print('IMPORT_OK')")
 UID_CODE = "import machine, ubinascii; print('UID=' + ubinascii.hexlify(machine.unique_id()).decode())"
 
@@ -91,21 +103,62 @@ def validate_makes(text: str) -> str | None:
     return None
 
 
-def default_broadcast(name: str) -> str:
-    return clean_broadcast(name).strip()[:MAX_BROADCAST]
+def broadcast_text(handle: str) -> str:
+    """What the badge advertises for this handle: printable ASCII only, at most 16 characters
+    (identical to lib/presence.py's rule, so desktop and badge agree)."""
+    return clean_broadcast(str(handle or ""))[:MAX_BROADCAST]
+
+
+default_broadcast = broadcast_text   # old name
+
+
+def broadcast_note(handle: str) -> str:
+    """Live hint for the UI: empty when the handle is broadcast exactly as typed."""
+    handle = str(handle or "").strip()
+    if not handle:
+        return ""
+    bt = broadcast_text(handle)
+    if bt == handle:
+        return ""
+    if not bt.strip():
+        return ("Your handle has no plain ASCII characters, so only the anonymous badge id is "
+                "broadcast over Bluetooth.")
+    parts = []
+    if clean_broadcast(handle) != handle:
+        parts.append("non-ASCII characters removed")
+    if len(clean_broadcast(handle)) > MAX_BROADCAST:
+        parts.append(f"clipped to {MAX_BROADCAST} characters")
+    return f"Broadcast over Bluetooth as \"{bt}\" ({', '.join(parts)}); the badge itself shows the full handle."
+
+
+def migrate_profile(p: dict) -> dict:
+    """Old profile -> new schema (in memory): "name" becomes "maker_handle" if there is none."""
+    p = dict(p)
+    if "name" in p and "maker_handle" not in p:
+        p["maker_handle"] = p.pop("name")
+    return p
+
+
+def profile_handle(p: dict) -> str:
+    return str((p or {}).get("maker_handle") or (p or {}).get("name") or "").strip()
+
+
+def drop_legacy(p: dict) -> dict:
+    """Profile as written from now on: legacy keys removed, everything else kept."""
+    p = migrate_profile(p)
+    for k in LEGACY_PROFILE_KEYS:
+        p.pop(k, None)
+    return p
 
 
 def get_profile(config) -> dict:
     p = config.get(PROFILE_KEY) or {}
-    return dict(p) if isinstance(p, dict) else {}
+    return migrate_profile(p) if isinstance(p, dict) else {}
 
 
-def make_profile(name: str, makes: str, enabled: bool, broadcast_text: str | None,
-                 applied_to=None) -> dict:
-    name = (name or "").strip()
-    bt = default_broadcast(name) if broadcast_text is None else clean_broadcast(broadcast_text)[:MAX_BROADCAST]
-    return {"name": name, "makes": clean_makes(makes)[:MAX_MAKES], "detector_enabled": bool(enabled),
-            "broadcast_text": bt, "onboarded": True, "applied_to": list(applied_to or [])}
+def make_profile(maker_handle: str, makes: str, enabled: bool, applied_to=None) -> dict:
+    return {"maker_handle": (maker_handle or "").strip(), "makes": clean_makes(makes)[:MAX_MAKES],
+            "detector_enabled": bool(enabled), "onboarded": True, "applied_to": list(applied_to or [])}
 
 
 def mark_applied(config, uid: str | None) -> None:
@@ -136,7 +189,13 @@ def _read_json(badge, path: str) -> dict:
 
 
 def read_settings(badge) -> dict:
+    """/data/maker.json (legacy Maker Detector settings)."""
     return _read_json(badge, SETTINGS_PATH)
+
+
+def read_owner(badge) -> dict:
+    """/data/owner.json ({} if missing/invalid)."""
+    return _read_json(badge, OWNER_PATH)
 
 
 def existing_id(badge, current: dict | None = None) -> str | None:
@@ -147,8 +206,22 @@ def existing_id(badge, current: dict | None = None) -> str | None:
     return None
 
 
+def build_owner(existing: dict, maker_handle: str, makes: str, broadcast: bool) -> bytes:
+    """owner.json content: our three keys updated, every other key of the existing file kept."""
+    err = validate_makes(makes)
+    if err:
+        raise ValueError(err)
+    out = dict(existing or {})
+    out["maker_handle"] = str(maker_handle or "").strip()
+    out["makes"] = makes
+    out["broadcast"] = bool(broadcast)
+    return json.dumps(out).encode()
+
+
 def build_settings(existing: dict, name: str, makes: str, broadcast: bool, badge_id: str | None,
                    display_name: str | None = None) -> bytes:
+    """maker.json content (name = broadcast text). Unknown keys kept. A legacy "display_name" (read
+    by older Maker Tag versions) is only kept in sync with the handle if the file already has one."""
     err = validate_broadcast(name) or validate_makes(makes)
     if err:
         raise ValueError(err)
@@ -158,17 +231,35 @@ def build_settings(existing: dict, name: str, makes: str, broadcast: bool, badge
     out["name"] = name
     out["makes"] = makes
     out["broadcast"] = bool(broadcast)
-    if display_name:
-        out["display_name"] = display_name   # shown by the Maker Tag app
+    if "display_name" in out and display_name is not None:
+        out["display_name"] = display_name
     return json.dumps(out).encode()
 
 
-def write_settings(badge, name: str, makes: str, broadcast: bool, display_name: str | None = None) -> dict:
-    """Write maker.json keeping the existing id (maker.json or nerd.json) and unknown keys."""
+def write_owner(badge, maker_handle: str, makes: str, broadcast: bool) -> dict:
+    """Read-modify-write /data/owner.json (other keys preserved)."""
+    data = build_owner(read_owner(badge), maker_handle, makes, broadcast)
+    badge.write_bytes(data, OWNER_PATH)
+    return json.loads(data)
+
+
+def write_maker_json(badge, maker_handle: str, makes: str, broadcast: bool) -> dict:
+    """Keep the legacy maker.json in sync: existing id (maker.json or nerd.json) and unknown keys kept."""
     cur = read_settings(badge)
-    data = build_settings(cur, name, makes, broadcast, existing_id(badge, cur), display_name)
+    data = build_settings(cur, broadcast_text(maker_handle), makes, broadcast, existing_id(badge, cur),
+                          display_name=str(maker_handle or "").strip())
     badge.write_bytes(data, SETTINGS_PATH)
     return json.loads(data)
+
+
+def write_settings(badge, maker_handle: str, makes: str, broadcast: bool, maker: bool = True) -> dict:
+    """Write owner.json and (if maker) maker.json. Returns {"owner": dict, "maker": dict | None}."""
+    makes = clean_makes(makes)[:MAX_MAKES]
+    maker_handle = str(maker_handle or "").strip()
+    out = {"owner": write_owner(badge, maker_handle, makes, broadcast), "maker": None}
+    if maker:
+        out["maker"] = write_maker_json(badge, maker_handle, makes, broadcast)
+    return out
 
 
 def badge_uid(badge) -> str | None:
@@ -237,9 +328,11 @@ def app_installed(badge) -> bool:
 
 
 def apply_job(badge, profile: dict, local: Path | None, log=print) -> dict:
-    """Blocking (device worker). Returns {"uid","action","settings","removed_old","migrated"}."""
+    """Blocking (device worker). Returns {"uid","action","settings","removed_old","migrated"}.
+    settings = {"owner": owner.json dict, "maker": maker.json dict or None}."""
     res = {"uid": badge_uid(badge), "action": "none", "settings": None,
            "removed_old": False, "migrated": False}
+    handle, makes = profile_handle(profile), profile.get("makes") or ""
     try:
         if profile.get("detector_enabled"):
             if local is not None:
@@ -250,16 +343,13 @@ def apply_job(badge, profile: dict, local: Path | None, log=print) -> dict:
             else:
                 raise FileNotFoundError("Maker Detector app file not found locally: "
                                         + ", ".join(str(p) for p in local_app_candidates()))
-            res["settings"] = write_settings(badge, profile.get("broadcast_text") or "",
-                                             profile.get("makes") or "", True,
-                                             profile.get("display_name") or profile.get("name"))
+            res["settings"] = write_settings(badge, handle, makes, True)
         else:
-            if app_installed(badge) or badge.exists(SETTINGS_PATH):
-                res["settings"] = write_settings(badge, clean_broadcast(read_settings(badge).get("name") or "")
-                                                 [:MAX_BROADCAST] or (profile.get("broadcast_text") or ""),
-                                                 profile.get("makes") or "", False,
-                                                 profile.get("display_name") or profile.get("name"))
-                res["action"] = "broadcast_off"
+            sync_maker = app_installed(badge) or badge.exists(SETTINGS_PATH)
+            was_on = bool(read_owner(badge).get("broadcast")) or \
+                bool(sync_maker and read_settings(badge).get("broadcast"))
+            res["settings"] = write_settings(badge, handle, makes, False, maker=sync_maker)
+            res["action"] = "broadcast_off" if was_on else "owner"
             old = _read_json(badge, OLD_SETTINGS_PATH)
             if badge.exists(OLD_APP_PATH) and old.get("broadcast"):
                 old["broadcast"] = False
@@ -272,12 +362,18 @@ def apply_job(badge, profile: dict, local: Path | None, log=print) -> dict:
 
 
 def probe_job(badge) -> dict:
-    """Blocking: what's on this badge? {"uid","installed","old_installed","broadcast"}."""
+    """Blocking: what's on this badge? {"uid","installed","old_installed","broadcast","owner"}."""
     uid = badge_uid(badge)
     s = read_settings(badge)
+    o = read_owner(badge)
     old = _read_json(badge, OLD_SETTINGS_PATH)
-    return {"uid": uid, "installed": app_installed(badge), "old_installed": badge.exists(OLD_APP_PATH),
-            "broadcast": bool(s.get("broadcast", True)) if s else bool(old.get("broadcast", False))}
+    installed, old_installed = app_installed(badge), badge.exists(OLD_APP_PATH)
+    # Broadcasting if owner.json says so (lib/presence.py, new detector) or a detector app's own
+    # settings file does (older detectors read only maker.json / nerd.json).
+    bc = bool(o.get("broadcast")) or bool(installed and s and s.get("broadcast", True)) or \
+        bool(old_installed and old.get("broadcast", False))
+    return {"uid": uid, "installed": installed, "old_installed": old_installed,
+            "broadcast": bc, "owner": o}
 
 
 # ====================================================================== ctx-level API
@@ -288,18 +384,22 @@ def _ask(parent, title: str, message: str) -> bool:
 
 
 def apply_profile_to_badge(ctx, profile: dict, on_done=None, on_error=None) -> None:
-    """Install/configure Maker Detector per profile on ctx's badge (device worker), hard reset,
-    record the badge uid in profile["applied_to"]. on_done(result) / on_error(exc) on Tk thread."""
+    """Write owner.json (+ maker.json) and install/configure Maker Detector per profile on ctx's badge
+    (device worker), hard reset, record the badge uid in profile["applied_to"].
+    on_done(result) / on_error(exc) on Tk thread."""
     profile = dict(profile)
     local = find_local_app(ctx.config.get("repo_dir")) if profile.get("detector_enabled") else None
 
     def done(res):
         mark_applied(ctx.config, res.get("uid"))
-        paths = [SETTINGS_PATH] + ([BADGE_APP_PATH, OLD_APP_PATH] if res["action"] == "installed" else [])
+        written = res.get("settings") or {}
+        paths = [OWNER_PATH] + ([SETTINGS_PATH] if written.get("maker") else []) + \
+            ([BADGE_APP_PATH, OLD_APP_PATH] if res["action"] == "installed" else [])
         ctx.events.publish("badge.files_changed", paths)
-        msg = {"installed": "Maker Detector installed, badge restarting",
-               "settings": "Maker Detector settings written, badge restarting",
-               "broadcast_off": "Maker Detector broadcasting switched off, badge restarting",
+        msg = {"installed": "Maker Detector installed and profile written, badge restarting",
+               "settings": "Profile and Maker Detector settings written, badge restarting",
+               "broadcast_off": "Profile written, broadcasting switched off, badge restarting",
+               "owner": "Maker handle written to the badge, badge restarting",
                "none": "Nothing to change on the badge"}[res["action"]]
         if res.get("removed_old"):
             msg += " (old Nerd Detector removed)"
@@ -309,7 +409,7 @@ def apply_profile_to_badge(ctx, profile: dict, on_done=None, on_error=None) -> N
             on_done(res)
 
     ctx.run_device_task(lambda: apply_job(ctx.badge, profile, local, log=ctx.log), done, on_error,
-                        title="Applying Maker Detector")
+                        title="Writing profile to badge")
 
 
 class _Applier:
@@ -340,19 +440,29 @@ class _Applier:
         if uid and uid in (p.get("applied_to") or []):
             return
         port = self.ctx.badge.port
+        handle = profile_handle(p)
+        owner = st.get("owner") or {}
         if p.get("detector_enabled"):
-            text = p.get("broadcast_text") or ""
+            text = broadcast_text(handle)
             q = (f"Install Maker Detector and broadcast '{text}' on the badge at {port}?"
-                 if text else f"Install Maker Detector (anonymous id only) on the badge at {port}?")
+                 if text.strip() else f"Install Maker Detector (anonymous id only) on the badge at {port}?")
+            if handle:
+                q += f"\n\nYour maker handle '{handle}' is also written to the badge (/data/owner.json)."
             q += "\n\nThe badge will hard-reset afterwards."
             if _ask(self.root, "Maker Detector", q):
                 apply_profile_to_badge(self.ctx, p)
                 return
-        elif (st.get("installed") or st.get("old_installed")) and st.get("broadcast"):
+        elif st.get("broadcast"):
             if _ask(self.root, "Maker Detector",
                     f"The badge at {port} has a detector app that broadcasts over Bluetooth, but your "
                     "profile has the Maker Detector off.\n\nSwitch broadcasting off on this badge? "
                     "(It will hard-reset.)"):
+                apply_profile_to_badge(self.ctx, p)
+                return
+        elif handle and (owner.get("maker_handle") != handle or (owner.get("makes") or "") != (p.get("makes") or "")):
+            if _ask(self.root, "Maker handle",
+                    f"Write your maker handle '{handle}' to the badge at {port} (/data/owner.json, shown "
+                    "by the name tag)? Broadcasting stays off.\n\nThe badge will hard-reset afterwards."):
                 apply_profile_to_badge(self.ctx, p)
                 return
         if uid:  # declined or nothing to do: remember so we ask only once per badge
@@ -394,12 +504,12 @@ class OnboardingWizard(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.skip)
         self.step = 0
 
-        self.name_var = ctk.StringVar(value=prev.get("name", ""))
+        self.name_var = ctk.StringVar(value=profile_handle(prev))   # the maker handle
+        self.handle_var = self.name_var
         self.makes_var = ctk.StringVar(value=prev.get("makes", ""))
         self.enabled_var = ctk.StringVar(value="yes" if prev.get("detector_enabled", True) else "no")
-        self.bt_var = ctk.StringVar(value=prev.get("broadcast_text", ""))
-        self._bt_touched = bool(prev.get("broadcast_text"))
-        self._cleaning = False
+        self.hint = None
+        self.counter = None
 
         self.header = ctk.CTkLabel(self, text="", text_color="gray60", anchor="w")
         self.header.pack(fill="x", padx=24, pady=(18, 0))
@@ -418,7 +528,6 @@ class OnboardingWizard(ctk.CTkToplevel):
         self.bind("<Return>", lambda _e: self.next())
         self.bind("<KP_Enter>", lambda _e: self.next())
         self.bind("<Escape>", lambda _e: self.skip())
-        self.bt_var.trace_add("write", lambda *_: self._bt_changed())
         self._show()
         self._center()
         self.after(50, self._grab)
@@ -468,17 +577,19 @@ class OnboardingWizard(ctk.CTkToplevel):
         self.back_btn.configure(state="normal" if self.step else "disabled")
         self.next_btn.configure(text="Finish" if self.step == self.STEPS - 1 else "Next")
         self.error = None
+        self.hint = None
         getattr(self, f"_step{self.step}")()
         self._validate()
         if self._focus:
             self.after(10, lambda f=self._focus: f.winfo_exists() and f.focus_set())
 
     def _step0(self) -> None:
-        self._title("What's your name?")
-        self._note("Used to personalise the badge. Stays on this computer unless you choose to broadcast it.")
-        e = ctk.CTkEntry(self.body, textvariable=self.name_var, width=360, placeholder_text="Your name")
+        self._title("What's your maker handle?")
+        self._note(HANDLE_HINT[0].upper() + HANDLE_HINT[1:] + ".")
+        e = ctk.CTkEntry(self.body, textvariable=self.name_var, width=360, placeholder_text="Maker handle")
         e.pack(anchor="w", pady=8)
         self.error = self._note("", color="#d9534f")
+        self.hint = self._note("")
         self._focus = e
         self._trace(self.name_var)
 
@@ -503,20 +614,15 @@ class OnboardingWizard(ctk.CTkToplevel):
         ctk.CTkRadioButton(row, text="No thanks", variable=self.enabled_var, value="no",
                            command=self._show).pack(side="left")
         if self.enabled_var.get() == "yes":
-            if not self._bt_touched:
-                self._set_bt(default_broadcast(self.name_var.get()))
-            r2 = ctk.CTkFrame(self.body, fg_color="transparent")
-            r2.pack(fill="x", pady=(8, 2))
-            ctk.CTkLabel(r2, text="Broadcast as:").pack(side="left")
-            e = ctk.CTkEntry(r2, textvariable=self.bt_var, width=220)
-            e.pack(side="left", padx=8)
-            self.counter = ctk.CTkLabel(r2, text="", text_color="gray60")
-            self.counter.pack(side="left")
-            self.hint = self._note("")
-            self._note("This text is PUBLIC: any phone or laptop nearby can read it. Up to 16 plain "
-                       "ASCII characters. You can change it or switch it off later in the Maker Detector tab.",
-                       color=("#8a5a00", "#e0a040"))
-            self._focus = e
+            bt = broadcast_text(self.name_var.get().strip())
+            self._note(f"Your badge will broadcast: \"{bt}\"" if bt.strip()
+                       else "Your badge will broadcast only its anonymous id.", color=None)
+            note = broadcast_note(self.name_var.get())
+            if note:
+                self.hint = self._note(note)
+            self._note("This text is PUBLIC: any phone or laptop nearby can read it. It is your maker "
+                       "handle (plain ASCII, up to 16 characters). You can switch it off later in the "
+                       "Maker Detector tab or in Settings.", color=("#8a5a00", "#e0a040"))
         else:
             self._note("Fine: nothing will be broadcast. You can turn it on later in the Maker Detector tab.")
         self.error = None
@@ -532,23 +638,6 @@ class OnboardingWizard(ctk.CTkToplevel):
         except Exception:  # noqa: BLE001
             pass
 
-    def _set_bt(self, v: str) -> None:
-        self._cleaning = True
-        self.bt_var.set(v)
-        self._cleaning = False
-
-    def _bt_changed(self) -> None:
-        if self._cleaning:
-            return
-        self._bt_touched = True
-        raw = self.bt_var.get()
-        cleaned = clean_broadcast(raw)
-        if cleaned != raw:
-            self._set_bt(cleaned)
-            if getattr(self, "hint", None) is not None and self.hint.winfo_exists():
-                self.hint.configure(text="Removed non-ASCII characters (the badge font is ASCII only).")
-        self._validate()
-
     def _validate(self) -> bool:
         ok, msg = True, ""
         if self.step == 0:
@@ -557,19 +646,14 @@ class OnboardingWizard(ctk.CTkToplevel):
                 ok, msg = False, f"Too long ({len(self.name_var.get())}/{MAX_NAME})"
             if self.error is not None and self.error.winfo_exists():
                 self.error.configure(text=msg)
+            if self.hint is not None and self.hint.winfo_exists():
+                self.hint.configure(text=broadcast_note(self.name_var.get()))
         elif self.step == 1:
             err = validate_makes(self.makes_var.get())
             ok = err is None
             if self.counter.winfo_exists():
                 self.counter.configure(text=err or f"{len(self.makes_var.get())}/{MAX_MAKES}",
                                        text_color="#d9534f" if err else "gray60")
-        elif self.step == 2 and self.enabled_var.get() == "yes":
-            bt = self.bt_var.get()
-            err = validate_broadcast(bt)
-            ok = err is None
-            c = getattr(self, "counter", None)
-            if c is not None and c.winfo_exists():
-                c.configure(text=err or f"{len(bt)}/{MAX_BROADCAST}", text_color="#d9534f" if err else "gray60")
         self.next_btn.configure(state="normal" if ok else "disabled")
         return ok
 
@@ -590,11 +674,8 @@ class OnboardingWizard(ctk.CTkToplevel):
 
     def profile(self) -> dict:
         enabled = self.enabled_var.get() == "yes" and self.step == self.STEPS - 1
-        bt = self.bt_var.get() if self._bt_touched else None
-        if bt is not None and validate_broadcast(bt):
-            bt = None
         makes = self.makes_var.get() if not validate_makes(self.makes_var.get()) else ""
-        return make_profile(self.name_var.get()[:MAX_NAME], makes, enabled, bt, self._applied)
+        return make_profile(self.name_var.get()[:MAX_NAME], makes, enabled, self._applied)
 
     def skip(self) -> None:
         """Save what's filled (detector only if the user reached and accepted step 3)."""
@@ -604,13 +685,10 @@ class OnboardingWizard(ctk.CTkToplevel):
         if self.done:
             return
         self.done = True
-        # Merge into the existing profile so keys set elsewhere (display_name, ...) survive.
-        prof = dict(self.ctx.config.get(PROFILE_KEY) or {})
-        old_name = prof.get("name")
-        new = self.profile()
-        if not prof.get("display_name") or prof.get("display_name") == old_name:
-            prof["display_name"] = new["name"]
-        prof.update(new)
+        # Merge into the existing profile so unknown keys survive; legacy name/display_name/
+        # broadcast_text are dropped (the handle is what the badge shows and broadcasts).
+        prof = drop_legacy(get_profile(self.ctx.config))
+        prof.update(self.profile())
         self.ctx.config.set(PROFILE_KEY, prof)
         try:
             self.ctx.events.publish("profile.changed", prof)

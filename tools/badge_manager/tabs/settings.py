@@ -9,10 +9,11 @@ Passwords live ONLY in the macOS Keychain as "wifi:<profile id>". They are never
 to config.json.
 
 "User Settings" edits config key "profile" (schema shared with core/onboarding.py):
-    {"name", "makes" (<=40), "detector_enabled", "broadcast_text" (<=16 printable ASCII),
-     "display_name" (Maker Tag left column; defaults to name), "onboarded", "applied_to": [...]}
-Saving keeps unknown keys plus "onboarded"/"applied_to" and publishes "profile.changed". Writing
-the badge (/data/maker.json) is done only by core.onboarding.apply_profile_to_badge (lazy import).
+    {"maker_handle" (<=60), "makes" (<=64), "detector_enabled", "onboarded", "applied_to": [...]}
+The broadcast text is derived from the handle (printable ASCII, clipped to 16). Saving keeps unknown
+keys plus "onboarded"/"applied_to", drops legacy "name"/"display_name"/"broadcast_text", and
+publishes "profile.changed". Writing the badge (/data/owner.json + /data/maker.json) is done only by
+core.onboarding.apply_profile_to_badge (lazy import).
 """
 
 from __future__ import annotations
@@ -88,9 +89,13 @@ def merge_imported(profiles: list[dict], entries: list[dict], set_password) -> t
 # ------------------------------------------------------------- user profile helpers (testable)
 PROFILE_KEY = "profile"
 MAX_NAME = 60
-MAX_MAKES = 40
+MAX_MAKES = 64
 MAX_BROADCAST = 16
-PROFILE_FORM_KEYS = ("name", "makes", "detector_enabled", "broadcast_text", "display_name")
+MAX_HANDLE = MAX_NAME
+PROFILE_FORM_KEYS = ("maker_handle", "makes", "detector_enabled")
+LEGACY_PROFILE_KEYS = ("name", "display_name", "broadcast_text")
+HANDLE_HINT = ("Required. A nickname or handle \u2014 not your legal name; it's shown on your badge and may "
+               "be broadcast publicly.")
 
 
 def is_broadcast_char(c: str) -> bool:
@@ -102,60 +107,74 @@ def clean_broadcast(text: str) -> str:
     return "".join(c for c in (text or "") if is_broadcast_char(c))
 
 
-def default_broadcast(name: str) -> str:
-    return clean_broadcast(name).strip()[:MAX_BROADCAST]
+def broadcast_text(handle: str) -> str:
+    """What the badge broadcasts for a handle: printable ASCII, clipped to 16 (as lib/presence.py)."""
+    return clean_broadcast(str(handle or ""))[:MAX_BROADCAST]
+
+
+default_broadcast = broadcast_text   # old name
+
+
+def broadcast_note(handle: str) -> str:
+    """Live note: empty when the handle is broadcast exactly as typed."""
+    handle = str(handle or "").strip()
+    bt = broadcast_text(handle)
+    if not handle or bt == handle:
+        return ""
+    if not bt.strip():
+        return "No plain ASCII characters: only the anonymous badge id is broadcast over Bluetooth."
+    parts = []
+    if clean_broadcast(handle) != handle:
+        parts.append("non-ASCII characters removed")
+    if len(clean_broadcast(handle)) > MAX_BROADCAST:
+        parts.append(f"clipped to {MAX_BROADCAST} characters")
+    return f"Broadcast as \"{bt}\" ({', '.join(parts)}); the badge itself shows the full handle."
 
 
 def load_profile(config) -> dict:
+    """Stored profile, with an old "name" read as "maker_handle" (core.config migrates it on load)."""
     p = config.get(PROFILE_KEY) or {}
-    return dict(p) if isinstance(p, dict) else {}
+    if not isinstance(p, dict):
+        return {}
+    p = dict(p)
+    if "name" in p and "maker_handle" not in p:
+        p["maker_handle"] = p.pop("name")
+    return p
 
 
 def profile_form(p: dict) -> dict:
     """The editable fields of a stored profile, with defaults filled in."""
-    name = str(p.get("name") or "")
-    bt = p.get("broadcast_text")
-    return {"name": name, "makes": str(p.get("makes") or ""),
-            "detector_enabled": bool(p.get("detector_enabled", False)),
-            "broadcast_text": default_broadcast(name) if bt is None else str(bt),
-            "display_name": str(p.get("display_name") or name)}
+    return {"maker_handle": str(p.get("maker_handle") or p.get("name") or ""),
+            "makes": str(p.get("makes") or ""),
+            "detector_enabled": bool(p.get("detector_enabled", False))}
 
 
 def effective_form(form: dict) -> dict:
-    """What would be stored: stripped, with empty broadcast/display name defaulting to the name."""
-    name = form["name"].strip()
-    return {"name": name, "makes": form["makes"].strip(), "detector_enabled": bool(form["detector_enabled"]),
-            "broadcast_text": form["broadcast_text"].strip() or default_broadcast(name),
-            "display_name": form["display_name"].strip() or name}
+    """What would be stored: stripped."""
+    return {"maker_handle": form["maker_handle"].strip(), "makes": form["makes"].strip(),
+            "detector_enabled": bool(form["detector_enabled"])}
 
 
 def validate_form(form: dict) -> dict[str, str]:
     """field -> error message (empty dict = valid). Expects an effective_form()."""
     err = {}
-    if not form["name"]:
-        err["name"] = "Name is required"
-    elif len(form["name"]) > MAX_NAME:
-        err["name"] = f"Too long ({len(form['name'])}/{MAX_NAME})"
+    h = form["maker_handle"]
+    if not h:
+        err["maker_handle"] = "Maker handle is required"
+    elif len(h) > MAX_HANDLE:
+        err["maker_handle"] = f"Too long ({len(h)}/{MAX_HANDLE})"
+    elif any(not c.isprintable() for c in h):
+        err["maker_handle"] = "Contains non-printable characters"
     if len(form["makes"]) > MAX_MAKES:
         err["makes"] = f"Too long ({len(form['makes'])}/{MAX_MAKES})"
     elif any(not c.isprintable() for c in form["makes"]):
         err["makes"] = "Contains non-printable characters"
-    bt = form["broadcast_text"]
-    bad = sorted({c for c in bt if not is_broadcast_char(c)})
-    if bad:
-        err["broadcast_text"] = "Only printable ASCII can be broadcast (not: " + " ".join(bad) + ")"
-    elif len(bt) > MAX_BROADCAST:
-        err["broadcast_text"] = f"Too long ({len(bt)}/{MAX_BROADCAST})"
-    elif not bt and form["detector_enabled"]:
-        err["broadcast_text"] = "Nothing to broadcast (the name has no ASCII letters)"
-    if len(form["display_name"]) > MAX_NAME:
-        err["display_name"] = f"Too long ({len(form['display_name'])}/{MAX_NAME})"
     return err
 
 
 def merge_profile(current: dict, form: dict) -> dict:
-    """current (as stored, unknown keys kept) updated with the effective form fields."""
-    out = dict(current)
+    """current (as stored, unknown keys kept, legacy keys dropped) updated with the form fields."""
+    out = {k: v for k, v in current.items() if k not in LEGACY_PROFILE_KEYS}
     out.update(effective_form(form))
     out.setdefault("applied_to", list(current.get("applied_to") or []))
     return out
@@ -233,12 +252,10 @@ class SettingsTab(BaseTab):
         page = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         self.pf_base: dict = {}          # effective form as last loaded/saved
         self._pf_loading = False
-        self._pf_last_name = ""
         self.pf_dirty = False
         self.pf_errors: dict[str, str] = {}
-        self.pf_vars = {"name": ctk.StringVar(), "makes": ctk.StringVar(),
-                        "detector_enabled": ctk.BooleanVar(value=False),
-                        "broadcast_text": ctk.StringVar(), "display_name": ctk.StringVar()}
+        self.pf_vars = {"maker_handle": ctk.StringVar(), "makes": ctk.StringVar(),
+                        "detector_enabled": ctk.BooleanVar(value=False)}
         muted, danger = COLORS["muted_text"], COLORS["danger_text"]
 
         s = Section(page, "User Settings")
@@ -265,21 +282,17 @@ class SettingsTab(BaseTab):
                 ctk.CTkLabel(d, text=hint, text_color=muted, anchor="w", justify="left").grid(
                     row=row + 2, column=1, columnspan=2, sticky="w")
 
-        field(0, "name", "Name *", "Required. Your name in this app.")
+        field(0, "maker_handle", "Maker handle *", HANDLE_HINT, counter=True)
         field(3, "makes", "What I like to make", f"Up to {MAX_MAKES} characters, e.g. 'synths and SAOs'.",
               counter=True)
-        self.pf_switch = ctk.CTkSwitch(d, text="Show Maker Detector broadcast",
+        self.pf_switch = ctk.CTkSwitch(d, text="Broadcast my presence (Maker Detector)",
                                        variable=self.pf_vars["detector_enabled"], command=self._pf_update)
         self.pf_switch.grid(row=6, column=1, sticky="w", pady=(10, 0))
-        ctk.CTkLabel(d, text="On: your badge advertises you to nearby badges. Off: it only listens.",
-                     text_color=muted, anchor="w").grid(row=7, column=1, columnspan=2, sticky="w")
-        field(8, "broadcast_text", "Broadcast as",
-              f"Up to {MAX_BROADCAST} printable ASCII characters. Follows your Name until you change it.",
-              counter=True)
-        self.pf_strip_btn = ctk.CTkButton(d, text="Remove non-ASCII", width=130, command=self.strip_broadcast)
-        field(11, "display_name", "Name tag display name",
-              "Optional. Shown on the left of the Maker Tag badge app. Defaults to Name; it is not "
-              "broadcast, so it can be longer.")
+        ctk.CTkLabel(d, text="On: your badge advertises your handle (plain ASCII, up to 16 characters) to "
+                     "nearby badges. Off: it only listens.",
+                     text_color=muted, anchor="w", justify="left").grid(row=7, column=1, columnspan=2, sticky="w")
+        self.pf_bcast_note = ctk.CTkLabel(d, text="", text_color=COLORS["warning_text"], anchor="w", justify="left")
+        self.pf_bcast_note.grid(row=8, column=1, columnspan=2, sticky="w")
 
         bar = ctk.CTkFrame(d, fg_color="transparent")
         bar.grid(row=14, column=1, columnspan=2, sticky="ew", pady=(14, 0))
@@ -304,8 +317,7 @@ class SettingsTab(BaseTab):
                      "the connected badge).", text_color=muted, anchor="w", justify="left").pack(fill="x")
         ctk.CTkButton(s.body, text="Run first-time setup again", width=200, command=self.rerun_setup).pack(anchor="w", pady=(6, 0))
 
-        self.pf_vars["name"].trace_add("write", lambda *_: self._pf_name_changed())
-        for k in ("makes", "broadcast_text", "display_name"):
+        for k in ("maker_handle", "makes"):
             self.pf_vars[k].trace_add("write", lambda *_: self._pf_update())
         return page
 
@@ -319,20 +331,8 @@ class SettingsTab(BaseTab):
         self._pf_loading = True
         for k, v in self.pf_vars.items():
             v.set(form[k])
-        self._pf_last_name = form["name"]
         self._pf_loading = False
         self.pf_base = effective_form(form)
-        self._pf_update()
-
-    def _pf_name_changed(self) -> None:
-        if not self._pf_loading:
-            new, old = self.pf_vars["name"].get(), self._pf_last_name
-            bt, dn = self.pf_vars["broadcast_text"], self.pf_vars["display_name"]
-            if bt.get().strip() in ("", default_broadcast(old)):
-                bt.set(default_broadcast(new))
-            if dn.get().strip() in ("", old.strip()):
-                dn.set(new.strip())
-            self._pf_last_name = new
         self._pf_update()
 
     def _pf_update(self) -> None:
@@ -346,14 +346,14 @@ class SettingsTab(BaseTab):
         self.pf_counters["makes"].configure(
             text=f"{len(eff['makes'])}/{MAX_MAKES}",
             text_color=COLORS["danger_text"] if len(eff["makes"]) > MAX_MAKES else COLORS["muted_text"])
-        n = len(eff["broadcast_text"])
-        self.pf_counters["broadcast_text"].configure(
-            text=f"{n}/{MAX_BROADCAST}",
-            text_color=COLORS["danger_text"] if n > MAX_BROADCAST else COLORS["muted_text"])
-        if any(not is_broadcast_char(c) for c in form["broadcast_text"]):
-            self.pf_strip_btn.grid(row=9, column=2, sticky="e", padx=(6, 0))
-        else:
-            self.pf_strip_btn.grid_forget()
+        n = len(eff["maker_handle"])
+        self.pf_counters["maker_handle"].configure(
+            text=f"{n}/{MAX_HANDLE}",
+            text_color=COLORS["danger_text"] if n > MAX_HANDLE else COLORS["muted_text"])
+        note = broadcast_note(eff["maker_handle"])
+        if note and not eff["detector_enabled"]:
+            note += " (Only if you switch broadcasting on.)"
+        self.pf_bcast_note.configure(text=note)
         self.pf_dirty = eff != self.pf_base
         self.pf_save_btn.configure(state="normal" if self.pf_dirty else "disabled")
         self.pf_revert_btn.configure(state="normal" if self.pf_dirty else "disabled")
@@ -366,10 +366,6 @@ class SettingsTab(BaseTab):
         parts = [f"Sent to {n} badge{'s' if n != 1 else ''}" if n else "Not sent to a badge yet",
                  "first-time setup done" if p.get("onboarded") else "first-time setup not done yet"]
         self.pf_info.configure(text="; ".join(parts) + ".")
-
-    def strip_broadcast(self) -> None:
-        v = self.pf_vars["broadcast_text"]
-        v.set(clean_broadcast(v.get()))
 
     def revert_user_profile(self) -> None:
         self.load_user_profile()

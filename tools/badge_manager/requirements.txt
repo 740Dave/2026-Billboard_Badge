@@ -4,3 +4,5 @@ esptool
 pillow
 keyring
 pyserial
+# Optional: Mac-side BLE scan in the Maker Detector tab (runs in a helper process)
+# bleak

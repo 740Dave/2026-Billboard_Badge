@@ -2,8 +2,8 @@
 
 Enable with:  BADGE_FAKE=1 .venv/bin/python app.py
 The "badge filesystem" is a temp folder seeded from upstream firmware/badge (origin/main).
-Same public methods as BadgeService. exec_py/exec_json only understand nothing: they raise,
-except info(), which is simulated. Slight delays mimic the real serial link.
+Same public methods as BadgeService. exec_py only simulates the /data/app_list read (LED-menu
+order, rebuilt at every reset()); otherwise it returns "". exec_json raises. info() is simulated. Slight delays mimic the real serial link.
 """
 
 from __future__ import annotations
@@ -34,7 +34,28 @@ class FakeBadgeService:
             except Exception as e:  # noqa: BLE001
                 log(f"fake badge: could not seed from repo: {e}")
         (self.root / "data").mkdir(exist_ok=True)
+        # Simulated /data/app_list (LED-menu order the app switcher writes at boot): names by 0-based
+        # slot, or None = file missing. Rebuilt on every reset(); tests may set it directly.
+        self.app_list: list[str] | None = None
+        self._boot_app_list()
         log(f"fake badge filesystem at {self.root}")
+
+    def _boot_app_list(self) -> None:
+        """Emulate the switcher at boot: every enabled app class, in a scrambled (dir()-like) order."""
+        try:
+            from tabs.apps import CORE_APP_FILES, MENU_DENY, app_names, concrete_classes
+            from .sources import parse_app
+            names = []
+            for f in sorted((self.root / "apps").glob("*.py")):
+                if f.name.startswith("_") or f.name in CORE_APP_FILES or f.stem in MENU_DENY:
+                    continue
+                src = f.read_text(errors="replace")
+                classes = concrete_classes(src, parse_app(src, ref="fake", path=str(f)).classes)
+                names += [n for _c, n, _s in app_names(src, classes)]
+            self.app_list = sorted(names, key=lambda n: hashlib.sha256(n.encode()).hexdigest()) or None
+        except Exception as e:  # noqa: BLE001
+            self.log(f"fake badge: could not build app_list: {e}")
+            self.app_list = None
 
     # helpers
     def _p(self, remote: str) -> Path:
@@ -63,6 +84,10 @@ class FakeBadgeService:
 
     def exec_py(self, code, timeout=60):
         self._sleep(2)
+        if "/data/app_list" in code and "btree" in code:   # tabs.apps.APP_LIST_CODE
+            if self.app_list is None:
+                return "SLOTS NONE OSError(2,)\n"
+            return f"SLOTS {[(i, n) for i, n in enumerate(self.app_list)]!r}\n"
         self.log("fake badge: exec_py is not simulated")
         return ""
 
@@ -154,6 +179,7 @@ class FakeBadgeService:
 
     def reset(self):
         self._sleep(10)
+        self._boot_app_list()
         self.log("fake badge: hard reset")
 
     def esptool(self, *args, timeout=600, line_cb=None):
