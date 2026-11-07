@@ -27,6 +27,16 @@ The row of WS2812-compatible LEDs is on GPIO38
 # Applications
 In its out of the box configuration the badge can show the 2026 Supercon schedule, act as a digital name tag, and cycle through a built-in collection of art from Hackaday's incredible Art Director Joe Kim. If you come up with additional apps that you'd like to share, feel free to make a pull request.
 
+## Owner profile (`/data/owner.json`)
+
+To put your handle on the name tag, create `/data/owner.json` on the badge, for example with `mpremote cp owner.json :/data/owner.json`:
+
+```json
+{"maker_handle": "740Dave", "makes": "robots and blinky things"}
+```
+
+`maker_handle` is a handle or nickname, not your real name: the badge is worn in public, so only put something there you are happy for strangers to see. The Nametag app writes it on the "HELLO I AM" sticker; without the file the sticker stays blank. Other apps can read it with `from lib.owner import owner` (`owner.maker_handle`, `owner.makes`, `owner.get(key, default)`, `owner.reload()`). The file is optional and is not part of the repo, so updating the firmware won't overwrite it. Apps that write to it should keep any keys they don't know about.
+
 # Displaying Images
 
 The badge's display only supports three colors: white, black, red. Shading between those needs to be implemented by dithering pixels of those colors together. Unlike LCD, CRT, or other displays you may be used to, you cannot set multiple colors within a single pixel, each pixel is only one of the three colors.
