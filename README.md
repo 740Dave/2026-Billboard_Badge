@@ -27,6 +27,20 @@ The row of WS2812-compatible LEDs is on GPIO38
 # Applications
 In its out of the box configuration the badge can show the 2026 Supercon schedule, act as a digital name tag, and cycle through a built-in collection of art from Hackaday's incredible Art Director Joe Kim. If you come up with additional apps that you'd like to share, feel free to make a pull request.
 
+## Badge presence (Bluetooth LE, off by default)
+
+`lib/presence.py` lets a badge announce itself so apps can count and list badges nearby. It is **off by default**: until you turn it on, Bluetooth is not even started. Turn it on by adding `"broadcast": true` to `/data/owner.json`, or from code with `presence.set_broadcast(True)` (saved to `owner.json`, other keys kept). `set_broadcast(False)` stops it.
+
+Only two things are broadcast: your `maker_handle` from `owner.json` (printable ASCII, at most 16 characters, may be empty) and a random 3-byte id kept in `/data/presence.json`. The id is not derived from the MAC address. The advert is non-connectable and repeats every 400 ms:
+
+```
+02 01 06                        flags
+LL FF  FF FF  'S' 'C' '2' '6'  01  ID ID ID  handle...
+       company 0xFFFF  magic   ver  random id  0-16 ASCII
+```
+
+Apps do their own scanning with `bluetooth.BLE().gap_scan(...)`; `presence.parse(adv_data)` returns `(id_hex, handle)` for a badge advert and `None` for anything else. `presence.badge_id()` gives your own id, so you can skip your own advert.
+
 # Displaying Images
 
 The badge's display only supports three colors: white, black, red. Shading between those needs to be implemented by dithering pixels of those colors together. Unlike LCD, CRT, or other displays you may be used to, you cannot set multiple colors within a single pixel, each pixel is only one of the three colors.
