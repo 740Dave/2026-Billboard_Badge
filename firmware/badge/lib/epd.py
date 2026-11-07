@@ -49,7 +49,7 @@ EPD_RST_PIN = Pin(11, mode=Pin.OUT)
 EPD_SCL_PIN = Pin(21, mode=Pin.OUT)
 EPD_SDA_PIN = Pin(47, mode=Pin.OUT)
 EPD_SPI_MISO_PIN = Pin(45, mode=Pin.IN)  # Not connected, signal not needed
-EPD_PWR_EN_PIN = 48
+EPD_PWR_EN_PIN = Pin(48, mode=Pin.OUT, value=False)
 
 
 pdi_cp = 0x9608
@@ -387,6 +387,7 @@ class EPaperDisplay:
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(True)
         await aio.sleep_ms(5)
+        self._send_index_data(0x70, [0x71, 0x36])  # B1 booster config, itc97; Errata 9
 
     def _send_images(
         self,
