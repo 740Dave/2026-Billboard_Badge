@@ -9,6 +9,8 @@ buttons; the grid never overlaps it.
 layout() is pure Python (testable off the badge); draw() renders it with LVGL.
 """
 
+import os
+
 import lvgl
 
 from lib.epd import display
@@ -36,6 +38,11 @@ HELP = (
     "SET BOOT APP: press all four buttons together. Again to unpin.",
     "Hold Menu + or Menu - while powering on to skip the boot app.",
 )
+OWNER_HELP = (
+    "MAKE IT YOURS: edit /data/owner.json via USB (mpremote or Thonny):",
+    '{"maker_handle": "...", "makes": "..."}',
+)
+"""Only shown when the badge has lib/owner.py (owner profile support)"""
 HELP_SIZES = (24, 16)  # 24 px where the rows leave room
 # (row label, slot number, app name, name lines), biggest first.
 # A slot number size of 0 puts the number in front of the name.
@@ -119,13 +126,13 @@ def _fit_name(m, name, size, max_w, max_h):
     return s, lines
 
 
-def layout(names, pinned=-1, selected=0, m=None):
+def layout(names, pinned=-1, selected=0, m=None, extra_help=()):
     """Lay out the grid for the app names. Returns a dict with "items", a list of
       ("text", x, y, w, size, color, [lines], align)  align: "left" or "right"
       ("box", x, y, w, h, border_width, color)        outline
       ("fill", x, y, w, h, color)
     and the chosen sizes. Nothing ever extends outside the panel, and the grid
-    stays above "help_top". m measures text: width(text, size), line_h(size), has_font(size)."""
+    stays above "help_top". extra_help: more help texts, added after HELP. m measures text: width(text, size), line_h(size), has_font(size)."""
     count = len(names)
     rows = (count + COLS - 1) // COLS
     full_w = W - 2 * MARGIN
@@ -155,8 +162,8 @@ def layout(names, pinned=-1, selected=0, m=None):
             cell_h += m.line_h(num_size)
         row_h = m.line_h(label_size) + LABEL_GAP + cell_h
         help_lines = []
-        for text in HELP:
-            help_lines += _wrap(m, text, help_size, full_w, 3)[0]
+        for text in HELP + tuple(extra_help):
+            help_lines += _wrap(m, text, help_size, full_w, 2)[0]
         help_top = H - MARGIN - len(help_lines) * m.line_h(help_size) - 2 - 6
         avail = help_top - 8 - grid_top
         choice = (preset, cell_h, row_h, help_size, help_lines, help_top, avail)
@@ -293,12 +300,23 @@ class _Measurer:
         _delete(self.scr)
 
 
+def _has_owner():
+    """Does this badge have owner profile support (lib/owner.py)?"""
+    for path in ("/lib/owner.py", "/lib/owner.mpy"):
+        try:
+            os.stat(path)
+            return True
+        except OSError:
+            pass
+    return False
+
+
 def draw(names, pinned=-1, selected=0):
     """Draw the grid to the panel. Blocks while LVGL renders, like an app's screen draw.
     LVGL objects are freed again afterwards (its heap is small)."""
     m = _Measurer()
     try:
-        lay = layout(names, pinned, selected, m)
+        lay = layout(names, pinned, selected, m, OWNER_HELP if _has_owner() else ())
     finally:
         m.close()
 

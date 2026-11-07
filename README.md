@@ -29,7 +29,7 @@ In its out of the box configuration the badge can show the 2026 Supercon schedul
 
 Press Menu +/- to open the app menu, Menu +/- to pick an app, and User A or B to launch it. The LED bar shows the selected app: each page of 8 apps has its own colour (orange, cyan, magenta, red, green, blue).
 
-Press Menu + and Menu - together, from the menu or inside any app, to open the menu and draw the app grid: every app with its slot number, one row per LED page, labelled with the page colour (e.g. "ROW 2 - CYAN (9-16)"), plus a short help text. The selection is still shown on the LED bar only, so the grid is drawn once and doesn't refresh while you move.
+Press Menu + and Menu - together, from the menu or inside any app, to open the menu and draw the app grid: every app with its slot number, one row per LED page, labelled with the page colour (e.g. "ROW 2 - CYAN (9-16)"), plus a short help text. If the badge has owner profile support (`lib/owner.py`), the help text also explains how to personalize the badge by editing `/data/owner.json` over USB, no desktop tool needed. The selection is still shown on the LED bar only, so the grid is drawn once and doesn't refresh while you move.
 
 Press all four buttons together to make the selected app (or, inside an app, the running app) the boot app. The LEDs flash green. Do it again on the same app to unpin it (red flash). The pinned app is drawn in red and marked BOOT on the grid.
 
