@@ -29,6 +29,7 @@ BOOT_CONFIG_FILE = "/data/boot.json"
 {"pinned": {"module": ..., "app": ...}} always boots that app"""
 
 CHORD_MS = 150
+RELEASE_QUIET_MS = 80  # after a chord, all buttons must stay up this long
 """Buttons pressed within this many ms of each other count as pressed together"""
 CHORD_GRID = "grid"
 CHORD_PIN = "pin"
@@ -51,6 +52,7 @@ class Chord:
         self.members = []
         self.start = 0
         self.latched = False
+        self.released_at = None  # when all buttons were last seen up while latched
 
     @staticmethod
     def _held(b):
@@ -67,12 +69,21 @@ class Chord:
     def poll(self, in_menu):
         now = time.ticks_ms()
         if self.latched:
-            # A chord happened: swallow everything until all buttons are up
-            self.latched = False
+            # A chord happened: swallow everything until all buttons have been up for
+            # RELEASE_QUIET_MS. lib/button.py doesn't debounce, so contacts bouncing as
+            # four fingers lift would otherwise look like a fresh four-button chord.
+            any_held = False
             for b in self.buttons:
                 if self._held(b):
                     b._pressed_state = PRESSED_READ
-                    self.latched = True
+                    any_held = True
+            if any_held:
+                self.released_at = None
+            elif self.released_at is None:
+                self.released_at = now
+            elif time.ticks_diff(now, self.released_at) >= RELEASE_QUIET_MS:
+                self.latched = False
+                self.released_at = None
             return None
 
         fresh = [b for b in self.buttons if b._pressed_state == PRESSED_UNREAD]
@@ -109,7 +120,8 @@ class Chord:
         else:
             result = members
         if result == CHORD_GRID or result == CHORD_PIN:
-            self.latched = held
+            self.latched = True       # always wait for a quiet release, even if already up
+            self.released_at = None
             print("Buttons pressed together:", result)
         self.members = []
         return result
