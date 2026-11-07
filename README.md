@@ -22,7 +22,7 @@ Each one is independent unless noted.
 - [#18 Resume the last app at boot](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/18)
 - [#19 Owner profile + Nametag handle](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/19)
 - [#20 App grid launcher](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/20) (builds on #18)
-- [#21](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/21) BLE presence broadcast (opt-in, off by default)
+- [#21 BLE presence broadcast](https://github.com/Hack-a-Day/2026-Billboard_Badge/pull/21) (opt-in, off by default)
 
 ## Branches
 
