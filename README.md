@@ -27,7 +27,15 @@ The row of WS2812-compatible LEDs is on GPIO38
 # Applications
 In its out of the box configuration the badge can show the 2026 Supercon schedule, act as a digital name tag, and cycle through a built-in collection of art from Hackaday's incredible Art Director Joe Kim. If you come up with additional apps that you'd like to share, feel free to make a pull request.
 
-Press Menu +/- to open the app menu, Menu +/- to pick an app, and User A or B to launch it. The badge remembers the last app launched from the menu (in `/data/last_app.json`) and starts it again at the next boot. Hold Menu + or Menu - while the badge boots to get the menu instead. To always boot into the menu, create `/data/boot.json` containing `{"resume": false}`.
+Press Menu +/- to open the app menu, Menu +/- to pick an app, and User A or B to launch it. The LED bar shows the selected app: each page of 8 apps has its own colour (orange, cyan, magenta, red, green, blue).
+
+Press Menu + and Menu - together, from the menu or inside any app, to open the menu and draw the app grid: every app with its slot number, one row per LED page, labelled with the page colour (e.g. "ROW 2 - CYAN (9-16)"), plus a short help text. The selection is still shown on the LED bar only, so the grid is drawn once and doesn't refresh while you move.
+
+Press all four buttons together to make the selected app (or, inside an app, the running app) the boot app. The LEDs flash green. Do it again on the same app to unpin it (red flash). The pinned app is drawn in red and marked BOOT on the grid.
+
+At boot the badge starts, in order of preference: the app grid if Menu + or Menu - is held down; the pinned boot app; the last app launched from the menu (remembered in `/data/last_app.json`); otherwise the app grid. Both settings live in `/data/boot.json`, e.g. `{"resume": true, "pinned": {"module": "nametag", "app": "Nametag"}}`. `{"resume": false}` turns off resuming the last app.
+
+Buttons count as pressed together when they go down within 150 ms of each other, so single presses act on release or after 150 ms. Inside an app, User A/B pressed before the Menu buttons still reach the app.
 
 # Displaying Images
 
