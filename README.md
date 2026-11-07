@@ -39,7 +39,7 @@ LL FF  FF FF  'S' 'C' '2' '6'  01  ID ID ID  handle...
        company 0xFFFF  magic   ver  random id  0-16 ASCII
 ```
 
-Apps do their own scanning with `bluetooth.BLE().gap_scan(...)`; `presence.parse(adv_data)` returns `(id_hex, handle)` for a badge advert and `None` for anything else. `presence.badge_id()` gives your own id, so you can skip your own advert.
+Apps do their own scanning with `bluetooth.BLE().gap_scan(...)`; `presence.parse(adv_data)` returns `(id_hex, handle)` for a badge advert and `None` for anything else. `presence.badge_id()` gives your own id, so you can skip your own advert. If your app shares the radio, only call `ble.active(True)` when `ble.active()` is `False`: on this firmware, re-activating a radio that's already on silently stops the presence advert. `presence` re-sends the advert every 30 s as a safety net.
 
 # Displaying Images
 

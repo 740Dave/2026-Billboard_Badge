@@ -10,6 +10,12 @@ What is broadcast (non-connectable advert, every 400 ms, 31 bytes max):
            ID ID ID                  3 random bytes from /data/presence.json (not the MAC)
            text...                   owner.json "maker_handle", printable ASCII, <= 16 bytes
 
+Keep the advert alive: on this firmware (MicroPython 1.24 / NimBLE, ESP32-S3) calling
+ble.active(True) while Bluetooth is ALREADY active restarts the stack and silently drops
+the advert (no error, active() still True). Apps that share the radio must check
+ble.active() before ble.active(True). As a safety net, main.py runs keep_alive(), which
+re-issues the advert every KEEPALIVE_S seconds while broadcasting (never when off).
+
 Scanning is up to each app. presence.parse(adv_data) turns a received advert into
 (id_hex, text), or None if it isn't a badge presence advert.
 """
@@ -27,6 +33,7 @@ MAGIC = b"SC26"
 VERSION = 1
 TEXT_MAX = 16
 INTERVAL_US = 400_000
+KEEPALIVE_S = 30     # re-assert the advert this often (see "Keep the advert alive")
 
 _ble = None        # bluetooth.BLE(), only created once broadcasting is wanted
 _started = False
@@ -109,7 +116,7 @@ def _payload(bid=None, txt=None):
     return b"\x02\x01\x06" + bytes([len(mfr) + 1, 0xFF]) + mfr
 
 
-def _apply(on):
+def _apply(on, quiet=False):
     global _ble, _on
     try:
         if on:
@@ -120,7 +127,8 @@ def _apply(on):
                 _ble.active(True)
             _ble.gap_advertise(INTERVAL_US, _payload(), connectable=False)
             _on = True
-            print("presence: broadcasting as", badge_id(), repr(text()))
+            if not quiet:
+                print("presence: broadcasting as", badge_id(), repr(text()))
         elif _ble is not None:
             # Only touch the radio if we turned it on; never wake BLE just to say "off".
             if _ble.active():
@@ -144,6 +152,18 @@ def start():
     _started = True
     if enabled():
         _apply(True)
+
+
+async def keep_alive(period_s=KEEPALIVE_S):
+    """asyncio task (main.py starts it): while broadcasting, re-issue the advert every
+    period_s seconds, so another ble.active(True) can't silence it until reboot.
+    Does nothing, and never touches Bluetooth, while broadcasting is off."""
+    import asyncio
+    await asyncio.sleep(2)   # first check right after boot: apps were created just before
+    while True:
+        if _on:
+            _apply(True, quiet=True)
+        await asyncio.sleep(period_s)
 
 
 def set_broadcast(on):
