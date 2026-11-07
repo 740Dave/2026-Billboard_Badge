@@ -17,7 +17,7 @@ _IN_REPO = (REPO_ROOT / ".git").exists() and (REPO_ROOT / "firmware" / "badge").
 _DEFAULT_REPO = REPO_ROOT if _IN_REPO else HOME / "repo"
 # Each user_apps/<name>/apps folder mirrors the badge's /apps (the Apps tab scans *.py there).
 _LOCAL_APPS = [d / "apps" if (d / "apps").is_dir() else d
-               for d in (REPO_ROOT / "user_apps" / n for n in ("artwork", "sao_blink", "nerd_detector"))]
+               for d in (REPO_ROOT / "user_apps" / n for n in ("artwork", "sao_blink", "maker_detector", "maker_tag"))]
 
 DEFAULTS = {
     "port": None,                      # last used serial port
@@ -25,7 +25,7 @@ DEFAULTS = {
     "backup_dir": str(HOME / "backups"),
     "artwork_cache": str(HOME / "artwork"),
     "local_app_dirs": [str(d) for d in _LOCAL_APPS if d.is_dir()],
-    "appearance": "System",            # System / Light / Dark
+    "appearance": "Dark",              # System / Light / Dark
     "backup_before_push": True,
     "wifi_profiles": [],               # [{"id","name","ssid","enabled","notes"}]; passwords live in keyring
 }
@@ -41,6 +41,21 @@ class Config:
                 self.data.update(json.loads(path.read_text()))
             except ValueError:
                 pass
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """One-time upgrades of settings saved by older versions."""
+        if "ui_version" not in self.data:
+            # Before ui_version 2 the default appearance was "System"; the app now defaults to Dark.
+            had_file = self.path.exists()
+            if self.data.get("appearance") == "System":
+                self.data["appearance"] = "Dark"
+            self.data["ui_version"] = 2
+            if had_file:
+                try:
+                    self.save()
+                except OSError:
+                    pass
 
     def get(self, key, default=None):
         return self.data.get(key, DEFAULTS.get(key, default))

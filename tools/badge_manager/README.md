@@ -4,17 +4,14 @@ A desktop app (customtkinter) for managing the Hackaday Supercon 2026 Billboard 
 
 ## Run it
 
-Needs Python 3.10+ with Tk. From a fresh clone of this repo:
-
 ```bash
-cd tools/badge_manager
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python app.py
+cd ~/Desktop/hackaday/badge_manager && .venv/bin/python app.py
 ```
 
-To try it **without a badge**, use a simulated badge (a temp folder seeded from upstream `firmware/badge`):
+To try it **without a badge**, use a simulated badge (a temp folder seeded from upstream):
 
 ```bash
-BADGE_FAKE=1 .venv/bin/python app.py
+cd ~/Desktop/hackaday/badge_manager && BADGE_FAKE=1 .venv/bin/python app.py
 ```
 
 **Badge checklist:**
@@ -61,7 +58,7 @@ tests/harness.py     smoke test: BADGE_FAKE=1 .venv/bin/python tests/harness.py 
 
 **Adding a tab:** create `tabs/foo.py` with `class FooTab(BaseTab)`, then add it to `TABS` in `app.py`. A tab that fails to import shows its error instead of crashing the app.
 
-**Fork data:** when the app runs from a clone of this repo, it uses that clone as its git cache (otherwise it clones upstream into `~/.badge_manager/repo`); change `repo_dir` in `~/.badge_manager/config.json` to use a separate clone. Every fork is added as a git remote. The official repo is whichever remote points at `Hack-a-Day/2026-Billboard_Badge` (`origin` in a plain clone, usually `upstream` in a clone of your own fork). Local app folders default to `user_apps/*/apps` in this repo. **Firmware → "Check GitHub for new forks + fetch"** adds new forks and pulls updates. Without a token the GitHub API allows 60 calls an hour; add a token in Settings → General to raise that.
+**Fork data:** the app reuses `~/Desktop/hackaday/repos/upstream` (every fork as a git remote). **Firmware → "Check GitHub for new forks + fetch"** adds new forks and pulls updates. Without a token the GitHub API allows 60 calls an hour; add a token in Settings → General to raise that.
 
 ## Status
 

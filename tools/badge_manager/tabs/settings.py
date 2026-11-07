@@ -7,6 +7,12 @@ visible network wins (SSID match is case-insensitive).
 Profile metadata (id, name, ssid, enabled, notes) lives in config key "wifi_profiles".
 Passwords live ONLY in the macOS Keychain as "wifi:<profile id>". They are never logged or saved
 to config.json.
+
+"User Settings" edits config key "profile" (schema shared with core/onboarding.py):
+    {"name", "makes" (<=40), "detector_enabled", "broadcast_text" (<=16 printable ASCII),
+     "display_name" (Maker Tag left column; defaults to name), "onboarded", "applied_to": [...]}
+Saving keeps unknown keys plus "onboarded"/"applied_to" and publishes "profile.changed". Writing
+the badge (/data/maker.json) is done only by core.onboarding.apply_profile_to_badge (lazy import).
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from core.config import CONFIG_FILE, KEYRING_SERVICE, get_secret, set_secret
+from core.theme import COLORS
 from .base import BaseTab, Section, confirm, info
 
 WIFI_JSON = "/data/wifi.json"
@@ -78,6 +85,82 @@ def merge_imported(profiles: list[dict], entries: list[dict], set_password) -> t
     return added, updated
 
 
+# ------------------------------------------------------------- user profile helpers (testable)
+PROFILE_KEY = "profile"
+MAX_NAME = 60
+MAX_MAKES = 40
+MAX_BROADCAST = 16
+PROFILE_FORM_KEYS = ("name", "makes", "detector_enabled", "broadcast_text", "display_name")
+
+
+def is_broadcast_char(c: str) -> bool:
+    return " " <= c <= "~"
+
+
+def clean_broadcast(text: str) -> str:
+    """Drop everything that is not printable ASCII (no length cut)."""
+    return "".join(c for c in (text or "") if is_broadcast_char(c))
+
+
+def default_broadcast(name: str) -> str:
+    return clean_broadcast(name).strip()[:MAX_BROADCAST]
+
+
+def load_profile(config) -> dict:
+    p = config.get(PROFILE_KEY) or {}
+    return dict(p) if isinstance(p, dict) else {}
+
+
+def profile_form(p: dict) -> dict:
+    """The editable fields of a stored profile, with defaults filled in."""
+    name = str(p.get("name") or "")
+    bt = p.get("broadcast_text")
+    return {"name": name, "makes": str(p.get("makes") or ""),
+            "detector_enabled": bool(p.get("detector_enabled", False)),
+            "broadcast_text": default_broadcast(name) if bt is None else str(bt),
+            "display_name": str(p.get("display_name") or name)}
+
+
+def effective_form(form: dict) -> dict:
+    """What would be stored: stripped, with empty broadcast/display name defaulting to the name."""
+    name = form["name"].strip()
+    return {"name": name, "makes": form["makes"].strip(), "detector_enabled": bool(form["detector_enabled"]),
+            "broadcast_text": form["broadcast_text"].strip() or default_broadcast(name),
+            "display_name": form["display_name"].strip() or name}
+
+
+def validate_form(form: dict) -> dict[str, str]:
+    """field -> error message (empty dict = valid). Expects an effective_form()."""
+    err = {}
+    if not form["name"]:
+        err["name"] = "Name is required"
+    elif len(form["name"]) > MAX_NAME:
+        err["name"] = f"Too long ({len(form['name'])}/{MAX_NAME})"
+    if len(form["makes"]) > MAX_MAKES:
+        err["makes"] = f"Too long ({len(form['makes'])}/{MAX_MAKES})"
+    elif any(not c.isprintable() for c in form["makes"]):
+        err["makes"] = "Contains non-printable characters"
+    bt = form["broadcast_text"]
+    bad = sorted({c for c in bt if not is_broadcast_char(c)})
+    if bad:
+        err["broadcast_text"] = "Only printable ASCII can be broadcast (not: " + " ".join(bad) + ")"
+    elif len(bt) > MAX_BROADCAST:
+        err["broadcast_text"] = f"Too long ({len(bt)}/{MAX_BROADCAST})"
+    elif not bt and form["detector_enabled"]:
+        err["broadcast_text"] = "Nothing to broadcast (the name has no ASCII letters)"
+    if len(form["display_name"]) > MAX_NAME:
+        err["display_name"] = f"Too long ({len(form['display_name'])}/{MAX_NAME})"
+    return err
+
+
+def merge_profile(current: dict, form: dict) -> dict:
+    """current (as stored, unknown keys kept) updated with the effective form fields."""
+    out = dict(current)
+    out.update(effective_form(form))
+    out.setdefault("applied_to", list(current.get("applied_to") or []))
+    return out
+
+
 # ------------------------------------------------------------------------------- the tab
 class SettingsTab(BaseTab):
     TITLE = "Settings"
@@ -118,28 +201,262 @@ class SettingsTab(BaseTab):
             padx=12, pady=(12, 8), anchor="w")
         self.pages: dict[str, ctk.CTkFrame] = {}
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
-        for name in ("Wi-Fi networks", "General"):
+        for name in ("User Settings", "Wi-Fi networks", "General"):
             b = ctk.CTkButton(nav, text=name, anchor="w", width=150, command=lambda n=name: self.show_page(n))
             b.pack(padx=10, pady=3)
             self.nav_buttons[name] = b
 
+        self.pages["User Settings"] = self._build_user(self)
         self.pages["Wi-Fi networks"] = self._build_wifi(self)
         self.pages["General"] = self._build_general(self)
-        self.show_page("Wi-Fi networks")
+        self.show_page("User Settings")
         self._refresh_list()
         if self.profiles:
             self.select(0)
         else:
             self._set_detail_state(False)
         self._load_token()
+        self.load_user_profile()
+        self.ctx.events.subscribe("profile.changed", self._on_profile_event)
 
     def show_page(self, name: str) -> None:
         for n, page in self.pages.items():
             page.grid_forget()
-            self.nav_buttons[n].configure(fg_color=("gray75", "gray30") if n != name else
-                                          ctk.ThemeManager.theme["CTkButton"]["fg_color"])
+            self.nav_buttons[n].configure(fg_color=COLORS["row"] if n != name else COLORS["accent"],
+                                          hover_color=COLORS["row_hover"] if n != name else COLORS["accent_hover"],
+                                          text_color=COLORS["text"] if n != name else COLORS["text_on_accent"])
         self.pages[name].grid(row=0, column=1, sticky="nsew")
         self.current_page = name
+
+    # ====================================================== User Settings page
+    def _build_user(self, parent):
+        page = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.pf_base: dict = {}          # effective form as last loaded/saved
+        self._pf_loading = False
+        self._pf_last_name = ""
+        self.pf_dirty = False
+        self.pf_errors: dict[str, str] = {}
+        self.pf_vars = {"name": ctk.StringVar(), "makes": ctk.StringVar(),
+                        "detector_enabled": ctk.BooleanVar(value=False),
+                        "broadcast_text": ctk.StringVar(), "display_name": ctk.StringVar()}
+        muted, danger = COLORS["muted_text"], COLORS["danger_text"]
+
+        s = Section(page, "User Settings")
+        s.pack(fill="x", pady=(0, 8))
+        d = s.body
+        d.grid_columnconfigure(1, weight=1)
+        self.pf_entries: dict[str, ctk.CTkEntry] = {}
+        self.pf_err_labels: dict[str, ctk.CTkLabel] = {}
+        self.pf_counters: dict[str, ctk.CTkLabel] = {}
+
+        def field(row, key, label, hint, counter=False):
+            ctk.CTkLabel(d, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=(6, 0), padx=(0, 10))
+            e = ctk.CTkEntry(d, textvariable=self.pf_vars[key])
+            e.grid(row=row, column=1, sticky="ew", pady=(6, 0))
+            self.pf_entries[key] = e
+            if counter:
+                c = ctk.CTkLabel(d, text="", width=56, anchor="e", text_color=muted)
+                c.grid(row=row, column=2, sticky="e", padx=(6, 0), pady=(6, 0))
+                self.pf_counters[key] = c
+            err = ctk.CTkLabel(d, text="", text_color=danger, anchor="w", justify="left")
+            err.grid(row=row + 1, column=1, sticky="w")
+            self.pf_err_labels[key] = err
+            if hint:
+                ctk.CTkLabel(d, text=hint, text_color=muted, anchor="w", justify="left").grid(
+                    row=row + 2, column=1, columnspan=2, sticky="w")
+
+        field(0, "name", "Name *", "Required. Your name in this app.")
+        field(3, "makes", "What I like to make", f"Up to {MAX_MAKES} characters, e.g. 'synths and SAOs'.",
+              counter=True)
+        self.pf_switch = ctk.CTkSwitch(d, text="Show Maker Detector broadcast",
+                                       variable=self.pf_vars["detector_enabled"], command=self._pf_update)
+        self.pf_switch.grid(row=6, column=1, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(d, text="On: your badge advertises you to nearby badges. Off: it only listens.",
+                     text_color=muted, anchor="w").grid(row=7, column=1, columnspan=2, sticky="w")
+        field(8, "broadcast_text", "Broadcast as",
+              f"Up to {MAX_BROADCAST} printable ASCII characters. Follows your Name until you change it.",
+              counter=True)
+        self.pf_strip_btn = ctk.CTkButton(d, text="Remove non-ASCII", width=130, command=self.strip_broadcast)
+        field(11, "display_name", "Name tag display name",
+              "Optional. Shown on the left of the Maker Tag badge app. Defaults to Name; it is not "
+              "broadcast, so it can be longer.")
+
+        bar = ctk.CTkFrame(d, fg_color="transparent")
+        bar.grid(row=14, column=1, columnspan=2, sticky="ew", pady=(14, 0))
+        self.pf_save_btn = ctk.CTkButton(bar, text="Save", width=90, command=self.save_user_profile)
+        self.pf_save_btn.pack(side="left")
+        self.pf_revert_btn = ctk.CTkButton(bar, text="Revert", width=90, fg_color=COLORS["danger"],
+                                           hover_color=COLORS["danger_hover"], command=self.revert_user_profile)
+        self.pf_revert_btn.pack(side="left", padx=6)
+        self.pf_send_btn = ctk.CTkButton(bar, text="Save & send to badge", width=170,
+                                         fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self.save_and_send_profile)
+        self.pf_send_btn.pack(side="left", padx=(12, 0))
+        self.pf_dirty_label = ctk.CTkLabel(bar, text="", text_color=COLORS["warning_text"])
+        self.pf_dirty_label.pack(side="left", padx=10)
+        self.pf_action = ctk.CTkLabel(d, text="", anchor="w", justify="left")
+        self.pf_action.grid(row=15, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        self.pf_info = ctk.CTkLabel(d, text="", text_color=muted, anchor="w", justify="left")
+        self.pf_info.grid(row=16, column=1, columnspan=2, sticky="w", pady=(2, 0))
+
+        s = Section(page, "First-time setup")
+        s.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(s.body, text="Walk through the welcome wizard again (it also offers your profile to "
+                     "the connected badge).", text_color=muted, anchor="w", justify="left").pack(fill="x")
+        ctk.CTkButton(s.body, text="Run first-time setup again", width=200, command=self.rerun_setup).pack(anchor="w", pady=(6, 0))
+
+        self.pf_vars["name"].trace_add("write", lambda *_: self._pf_name_changed())
+        for k in ("makes", "broadcast_text", "display_name"):
+            self.pf_vars[k].trace_add("write", lambda *_: self._pf_update())
+        return page
+
+    # ------------------------------------------------------------ form state
+    def pf_form(self) -> dict:
+        return {k: v.get() for k, v in self.pf_vars.items()}
+
+    def load_user_profile(self) -> None:
+        """(Re)load the form from config, discarding unsaved edits."""
+        form = profile_form(load_profile(self.ctx.config))
+        self._pf_loading = True
+        for k, v in self.pf_vars.items():
+            v.set(form[k])
+        self._pf_last_name = form["name"]
+        self._pf_loading = False
+        self.pf_base = effective_form(form)
+        self._pf_update()
+
+    def _pf_name_changed(self) -> None:
+        if not self._pf_loading:
+            new, old = self.pf_vars["name"].get(), self._pf_last_name
+            bt, dn = self.pf_vars["broadcast_text"], self.pf_vars["display_name"]
+            if bt.get().strip() in ("", default_broadcast(old)):
+                bt.set(default_broadcast(new))
+            if dn.get().strip() in ("", old.strip()):
+                dn.set(new.strip())
+            self._pf_last_name = new
+        self._pf_update()
+
+    def _pf_update(self) -> None:
+        if self._pf_loading:
+            return
+        form = self.pf_form()
+        eff = effective_form(form)
+        self.pf_errors = validate_form(eff)
+        for k, lbl in self.pf_err_labels.items():
+            lbl.configure(text=self.pf_errors.get(k, ""))
+        self.pf_counters["makes"].configure(
+            text=f"{len(eff['makes'])}/{MAX_MAKES}",
+            text_color=COLORS["danger_text"] if len(eff["makes"]) > MAX_MAKES else COLORS["muted_text"])
+        n = len(eff["broadcast_text"])
+        self.pf_counters["broadcast_text"].configure(
+            text=f"{n}/{MAX_BROADCAST}",
+            text_color=COLORS["danger_text"] if n > MAX_BROADCAST else COLORS["muted_text"])
+        if any(not is_broadcast_char(c) for c in form["broadcast_text"]):
+            self.pf_strip_btn.grid(row=9, column=2, sticky="e", padx=(6, 0))
+        else:
+            self.pf_strip_btn.grid_forget()
+        self.pf_dirty = eff != self.pf_base
+        self.pf_save_btn.configure(state="normal" if self.pf_dirty else "disabled")
+        self.pf_revert_btn.configure(state="normal" if self.pf_dirty else "disabled")
+        self.pf_dirty_label.configure(text="● Unsaved changes" if self.pf_dirty else "")
+        self._pf_refresh_info()
+
+    def _pf_refresh_info(self) -> None:
+        p = load_profile(self.ctx.config)
+        n = len(p.get("applied_to") or [])
+        parts = [f"Sent to {n} badge{'s' if n != 1 else ''}" if n else "Not sent to a badge yet",
+                 "first-time setup done" if p.get("onboarded") else "first-time setup not done yet"]
+        self.pf_info.configure(text="; ".join(parts) + ".")
+
+    def strip_broadcast(self) -> None:
+        v = self.pf_vars["broadcast_text"]
+        v.set(clean_broadcast(v.get()))
+
+    def revert_user_profile(self) -> None:
+        self.load_user_profile()
+        self.pf_action.configure(text="")
+
+    def save_user_profile(self) -> dict | None:
+        """Validate and store locally. Returns the saved profile, or None if invalid."""
+        eff = effective_form(self.pf_form())
+        errs = validate_form(eff)
+        if errs:
+            self._pf_update()
+            self.pf_action.configure(text="Not saved: " + "; ".join(errs.values()),
+                                     text_color=COLORS["danger_text"])
+            return None
+        prof = merge_profile(load_profile(self.ctx.config), self.pf_form())
+        self.ctx.config.set(PROFILE_KEY, prof)
+        self.load_user_profile()
+        self.pf_action.configure(text="Saved on this computer.", text_color=COLORS["text"])
+        self.ctx.status("User settings saved")
+        self.ctx.events.publish("profile.changed", dict(prof))
+        return prof
+
+    def save_and_send_profile(self) -> None:
+        prof = self.save_user_profile() if self.pf_dirty else load_profile(self.ctx.config)
+        if prof is None:
+            return
+        if validate_form(effective_form(profile_form(prof))):
+            self.pf_action.configure(text="Fix the fields above first.", text_color=COLORS["danger_text"])
+            return
+        try:
+            from core.onboarding import apply_profile_to_badge
+        except Exception as e:  # noqa: BLE001  (module missing or mid-edit)
+            self.pf_action.configure(text=f"Saved locally; sending is unavailable ({e}).",
+                                     text_color=COLORS["warning_text"])
+            self._info("Can't send to badge", "The badge setup module (core/onboarding.py) could not be "
+                       f"loaded:\n\n{e}\n\nYour settings were saved on this computer.")
+            return
+
+        def done(_res):
+            self.pf_action.configure(text="Sent to the badge.", text_color=COLORS["success_text"])
+            self.ctx.events.publish("profile.changed", load_profile(self.ctx.config))  # applied_to changed
+
+        def failed(e):
+            if str(e) == "no port":
+                e = "select the badge's port in the top bar first"
+            self.pf_action.configure(text=f"Sending failed: {e}", text_color=COLORS["danger_text"])
+
+        self.pf_action.configure(text="Sending to the badge...", text_color=COLORS["text"])
+        apply_profile_to_badge(self.ctx, dict(prof), on_done=done, on_error=failed)
+
+    def _on_profile_event(self, _payload) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001  (tab destroyed)
+            return
+        if not self.pf_dirty:
+            self.load_user_profile()
+        else:
+            self._pf_refresh_info()
+            self.pf_action.configure(text="The profile was changed elsewhere; Revert to load it.",
+                                     text_color=COLORS["warning_text"])
+
+    def rerun_setup(self) -> None:
+        if self.pf_dirty and not self._confirm("Unsaved changes", "Discard your unsaved user settings and "
+                                               "run first-time setup?"):
+            return
+        try:
+            from core.onboarding import maybe_run_onboarding
+        except Exception as e:  # noqa: BLE001
+            self._info("Setup unavailable", f"The first-time setup (core/onboarding.py) could not be loaded:\n\n{e}")
+            return
+        win = maybe_run_onboarding(self.winfo_toplevel(), self.ctx, force=True)
+        self.setup_window = win
+
+        def wait():
+            try:
+                alive = win is not None and win.winfo_exists()
+            except Exception:  # noqa: BLE001
+                alive = False
+            if alive:
+                self.after(300, wait)
+            else:
+                self.load_user_profile()
+                self.pf_action.configure(text="")
+                self.ctx.events.publish("profile.changed", load_profile(self.ctx.config))
+        wait()
 
     # =========================================================== Wi-Fi page
     def _build_wifi(self, parent):
@@ -158,7 +475,8 @@ class SettingsTab(BaseTab):
                                         ("Delete", self.delete_profile), ("Move up", lambda: self.move(-1)),
                                         ("Move down", lambda: self.move(1))]):
             ctk.CTkButton(btns, text=txt, width=80, command=cmd,
-                          fg_color="#b33" if txt == "Delete" else None).grid(
+                          fg_color=COLORS["danger"] if txt == "Delete" else None,
+                          hover_color=COLORS["danger_hover"] if txt == "Delete" else None).grid(
                 row=i // 3, column=i % 3, padx=2, pady=2, sticky="ew")
 
         # ---- detail
@@ -198,13 +516,13 @@ class SettingsTab(BaseTab):
         bar.grid(row=row, column=1, columnspan=2, sticky="ew", pady=(8, 0))
         self.b_save = ctk.CTkButton(bar, text="Save", width=90, command=self.save_profile)
         self.b_save.pack(side="left")
-        self.b_revert = ctk.CTkButton(bar, text="Revert", width=90, fg_color="gray40", command=self.revert)
+        self.b_revert = ctk.CTkButton(bar, text="Revert", width=90, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self.revert)
         self.b_revert.pack(side="left", padx=6)
-        self.dirty_label = ctk.CTkLabel(bar, text="", text_color="#e0a030")
+        self.dirty_label = ctk.CTkLabel(bar, text="", text_color=COLORS["warning_text"])
         self.dirty_label.pack(side="left", padx=8)
         row += 1
         ctk.CTkLabel(d, text="Passwords are kept in the macOS Keychain, never in config.json.",
-                     text_color="gray55", anchor="w").grid(row=row, column=1, columnspan=2, sticky="w", pady=(10, 0))
+                     text_color=COLORS["muted_text"], anchor="w").grid(row=row, column=1, columnspan=2, sticky="w", pady=(10, 0))
         for v in (self.v_name, self.v_ssid, self.v_pwd):
             v.trace_add("write", lambda *_: self._mark_dirty())
 
@@ -212,14 +530,14 @@ class SettingsTab(BaseTab):
         actions = ctk.CTkFrame(page)
         actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ctk.CTkButton(actions, text="Preview badge file", command=self.preview).pack(side="left", padx=6, pady=8)
-        ctk.CTkButton(actions, text="Write to badge", command=self.write_to_badge).pack(side="left", padx=6)
+        ctk.CTkButton(actions, text="Write to badge", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self.write_to_badge).pack(side="left", padx=6)
         ctk.CTkButton(actions, text="Read from badge", command=self.read_from_badge).pack(side="left", padx=6)
-        ctk.CTkButton(actions, text="Test on badge", fg_color="gray40", command=self.test_on_badge).pack(
+        ctk.CTkButton(actions, text="Test on badge", command=self.test_on_badge).pack(
             side="left", padx=6)
         self.action_label = ctk.CTkLabel(actions, text="", anchor="w")
         self.action_label.pack(side="left", padx=10, fill="x", expand=True)
         ctk.CTkLabel(page, text="Wi-Fi support (lib/wifi.py) by Kevin Criqui, from the kcriqui fork.",
-                     text_color="gray55", anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                     text_color=COLORS["muted_text"], anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         return page
 
     # -------------------------------------------------------------- master list
@@ -227,8 +545,8 @@ class SettingsTab(BaseTab):
         for w in self.list_frame.winfo_children():
             w.destroy()
         if not self.profiles:
-            ctk.CTkLabel(self.list_frame, text="No networks yet.\nClick Add.", text_color="gray55").pack(pady=20)
-        accent = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
+            ctk.CTkLabel(self.list_frame, text="No networks yet.\nClick Add.", text_color=COLORS["muted_text"]).pack(pady=20)
+        accent = COLORS["accent"]
         for i, p in enumerate(self.profiles):
             mark = "\u2713" if p.get("enabled", True) else "  "
             label = f"{mark}  {i + 1}. {p.get('name') or '(unnamed)'}"
@@ -236,8 +554,8 @@ class SettingsTab(BaseTab):
                 label += f"   ({p['ssid']})"
             ctk.CTkButton(self.list_frame, text=label, anchor="w",
                           fg_color=accent if i == self.sel else "transparent",
-                          text_color=None if i == self.sel else ("gray10", "gray90"),
-                          hover_color=("gray70", "gray30"),
+                          text_color=None if i == self.sel else COLORS["text"],
+                          hover_color=COLORS["accent_hover"] if i == self.sel else COLORS["row_hover"],
                           command=lambda i=i: self.select(i)).pack(fill="x", pady=1)
 
     def select(self, i: int) -> None:
@@ -545,7 +863,7 @@ class SettingsTab(BaseTab):
         s.pack(fill="x", pady=(0, 8))
         self.appearance = ctk.CTkSegmentedButton(s.body, values=["System", "Light", "Dark"],
                                                  command=self.set_appearance)
-        self.appearance.set(cfg.get("appearance") or "System")
+        self.appearance.set(cfg.get("appearance") or "Dark")
         self.appearance.pack(anchor="w")
 
         s = Section(page, "Backups")
@@ -575,7 +893,7 @@ class SettingsTab(BaseTab):
         ctk.CTkButton(row, text="Open in Finder", width=110,
                       command=lambda: self.reveal(cfg.get("repo_dir"))).pack(side="left", padx=6)
         ctk.CTkLabel(s.body, text=f"To change it, edit \"repo_dir\" in {CONFIG_FILE} and restart the app.",
-                     text_color="gray55", anchor="w").pack(fill="x", pady=(4, 0))
+                     text_color=COLORS["muted_text"], anchor="w").pack(fill="x", pady=(4, 0))
 
         s = Section(page, "Local app folders")
         s.pack(fill="x", pady=(0, 8))
@@ -588,7 +906,7 @@ class SettingsTab(BaseTab):
         s.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(s.body, text="Raises the GitHub API limit (60/hour without) when syncing forks. "
                      "A token with no scopes is enough. Stored in the Keychain.",
-                     text_color="gray55", anchor="w", justify="left").pack(fill="x")
+                     text_color=COLORS["muted_text"], anchor="w", justify="left").pack(fill="x")
         row = ctk.CTkFrame(s.body, fg_color="transparent")
         row.pack(fill="x", pady=(4, 0))
         self.v_token = ctk.StringVar()
@@ -596,8 +914,8 @@ class SettingsTab(BaseTab):
                                     placeholder_text="ghp_... / github_pat_...")
         self.e_token.pack(side="left")
         ctk.CTkButton(row, text="Save", width=70, command=self.save_token).pack(side="left", padx=4)
-        ctk.CTkButton(row, text="Clear", width=70, fg_color="gray40", command=self.clear_token).pack(side="left")
-        self.token_label = ctk.CTkLabel(row, text="", text_color="gray55")
+        ctk.CTkButton(row, text="Clear", width=70, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self.clear_token).pack(side="left")
+        self.token_label = ctk.CTkLabel(row, text="", text_color=COLORS["muted_text"])
         self.token_label.pack(side="left", padx=8)
 
         s = Section(page, "About")
@@ -642,13 +960,13 @@ class SettingsTab(BaseTab):
             w.destroy()
         dirs = list(self.ctx.config.get("local_app_dirs") or [])
         if not dirs:
-            ctk.CTkLabel(self.dirs_frame, text="(none)", text_color="gray55").pack(anchor="w")
+            ctk.CTkLabel(self.dirs_frame, text="(none)", text_color=COLORS["muted_text"]).pack(anchor="w")
         for d in dirs:
             row = ctk.CTkFrame(self.dirs_frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
             missing = "" if Path(d).exists() else "   (missing)"
             ctk.CTkLabel(row, text=d + missing, anchor="w").pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(row, text="Remove", width=70, fg_color="gray40",
+            ctk.CTkButton(row, text="Remove", width=70,
                           command=lambda d=d: self.remove_app_dir(d)).pack(side="right")
 
     def add_app_dir(self, path: str | None = None) -> None:

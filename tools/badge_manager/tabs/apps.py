@@ -27,6 +27,9 @@ import customtkinter as ctk
 from core.config import HOME
 from core.sources import BADGE_SUBDIR, parse_app
 
+from core import theme
+from core.theme import COLORS
+
 from .base import BaseTab, Section, human_size
 
 REMOVED_DIR = HOME / "removed_apps"
@@ -436,22 +439,9 @@ def execute_plan(badge, plan: InstallPlan, include_optional: bool = False,
 
 # ====================================================================== small windows
 def _style_tree(widget: ttk.Treeview) -> None:
-    dark = ctk.get_appearance_mode() == "Dark"
-    st = ttk.Style(widget)
-    try:
-        st.theme_use("clam")
-    except tk.TclError:
-        pass
-    bg, fg, sel = ("#2b2b2b", "#dcdcdc", "#1f6aa5") if dark else ("#ffffff", "#1a1a1a", "#3b8ed0")
-    st.configure("Apps.Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=24,
-                 borderwidth=0)
-    st.map("Apps.Treeview", background=[("selected", sel)], foreground=[("selected", "white")])
-    st.configure("Apps.Treeview.Heading", background="#3a3a3a" if dark else "#e5e5e5",
-                 foreground=fg, relief="flat")
-    widget.configure(style="Apps.Treeview")
-    widget.tag_configure("muted", foreground="gray55")
-    widget.tag_configure("warn", foreground="#d08a1f")
-    widget.tag_configure("ok", foreground="#3ba55d")
+    # Follows light/dark mode (re-styles itself when the appearance changes); defines the
+    # "muted" / "warn" / "ok" row tags.
+    theme.style_treeview(widget, "Apps.Treeview", rowheight=24)
 
 
 def show_text_window(parent, title: str, text: str) -> ctk.CTkToplevel:
@@ -483,9 +473,9 @@ class PlanDialog(ctk.CTkToplevel):
                                  "(old versions are saved locally)").pack(anchor="w", padx=10, pady=4)
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(4, 10))
-        ctk.CTkButton(row, text="Cancel", fg_color="gray40", width=100,
+        ctk.CTkButton(row, text="Cancel", fg_color=COLORS["neutral"], hover_color=COLORS["neutral_hover"], width=100,
                       command=self.destroy).pack(side="right", padx=4)
-        ok = ctk.CTkButton(row, text="Install", width=120, command=self._ok)
+        ok = ctk.CTkButton(row, text="Install", width=120, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"], command=self._ok)
         ok.pack(side="right", padx=4)
         if not plan.copy and not plan.optional:
             ok.configure(state="disabled")
@@ -526,12 +516,13 @@ class AppsTab(BaseTab):
         bar.pack(fill="x", padx=4, pady=(4, 6))
         ctk.CTkButton(bar, text="Refresh badge", width=120, command=self.refresh_badge).pack(side="left", padx=4)
         ctk.CTkButton(bar, text="Rescan sources", width=120, command=self.refresh_catalog).pack(side="left", padx=4)
-        ctk.CTkButton(bar, text="Install from file…", width=140, command=self.install_from_file).pack(side="left", padx=4)
-        self.apply_btn = ctk.CTkButton(bar, text="Apply & restart badge", width=170, fg_color="gray40",
+        ctk.CTkButton(bar, text="Install from file…", width=140, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
+                      command=self.install_from_file).pack(side="left", padx=4)
+        self.apply_btn = ctk.CTkButton(bar, text="Apply & restart badge", width=170, fg_color=COLORS["neutral"], hover_color=COLORS["neutral_hover"],
                                        command=self.apply_restart)
         self.apply_btn.pack(side="right", padx=4)
         self.apply_note = ctk.CTkLabel(bar, text="New/enabled apps appear in the LED menu after a restart.",
-                                       text_color="gray60")
+                                       text_color=COLORS["muted_text"])
         self.apply_note.pack(side="right", padx=8)
 
         panes = ctk.CTkFrame(self, fg_color="transparent")
@@ -543,7 +534,7 @@ class AppsTab(BaseTab):
         # ---- left: on the badge
         left = Section(panes, "On the badge")
         left.grid(row=0, column=0, sticky="nsew", padx=(4, 4))
-        self.badge_info = ctk.CTkLabel(left.body, text="Not scanned yet", anchor="w", text_color="gray60")
+        self.badge_info = ctk.CTkLabel(left.body, text="Not scanned yet", anchor="w", text_color=COLORS["muted_text"])
         self.badge_info.pack(fill="x")
         tf = tk.Frame(left.body)
         tf.pack(fill="both", expand=True, pady=4)
@@ -567,7 +558,7 @@ class AppsTab(BaseTab):
         row.pack(fill="x", pady=(4, 0))
         self.toggle_btn = ctk.CTkButton(row, text="Disable", width=90, command=self.toggle_selected, state="disabled")
         self.toggle_btn.pack(side="left", padx=(0, 4))
-        self.remove_btn = ctk.CTkButton(row, text="Remove…", width=90, fg_color="#a33", hover_color="#822",
+        self.remove_btn = ctk.CTkButton(row, text="Remove…", width=90, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                                         command=self.remove_selected, state="disabled")
         self.remove_btn.pack(side="left", padx=4)
         self.bsrc_btn = ctk.CTkButton(row, text="Open source", width=100, command=self.open_badge_source,
@@ -591,7 +582,7 @@ class AppsTab(BaseTab):
         self.cat_progress = ctk.CTkProgressBar(prow, height=8)
         self.cat_progress.set(0)
         self.cat_progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.cat_label = ctk.CTkLabel(prow, text="Sources not scanned yet", text_color="gray60", width=260,
+        self.cat_label = ctk.CTkLabel(prow, text="Sources not scanned yet", text_color=COLORS["muted_text"], width=260,
                                       anchor="e")
         self.cat_label.pack(side="right")
         tf2 = tk.Frame(right.body)
@@ -619,7 +610,8 @@ class AppsTab(BaseTab):
         ctk.CTkLabel(irow, text="Install from:").pack(side="left")
         self.prov_menu = ctk.CTkOptionMenu(irow, values=["-"], width=260)
         self.prov_menu.pack(side="left", padx=6)
-        self.install_btn = ctk.CTkButton(irow, text="Install…", width=100, command=self.install_selected,
+        self.install_btn = ctk.CTkButton(irow, text="Install…", width=100, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
+                                         command=self.install_selected,
                                          state="disabled")
         self.install_btn.pack(side="left", padx=4)
         self.csrc_btn = ctk.CTkButton(irow, text="Open source", width=100, command=self.open_catalog_source,
@@ -768,9 +760,9 @@ class AppsTab(BaseTab):
 
     def _changed(self, paths: list[str], msg: str) -> None:
         self._dirty = True
-        self.apply_btn.configure(fg_color=("#3b8ed0", "#1f6aa5"))
+        self.apply_btn.configure(fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"])
         self.apply_note.configure(text="Changes pending: restart the badge to update the LED menu.",
-                                  text_color="#d08a1f")
+                                  text_color=COLORS["warning_text"])
         self.ctx.status(msg)
         self.ctx.log(msg)
         self.ctx.events.publish("badge.files_changed", paths)
@@ -778,9 +770,9 @@ class AppsTab(BaseTab):
     def apply_restart(self) -> None:
         def done(_):
             self._dirty = False
-            self.apply_btn.configure(fg_color="gray40")
+            self.apply_btn.configure(fg_color=COLORS["neutral"], hover_color=COLORS["neutral_hover"])
             self.apply_note.configure(text="Badge restarted; new apps are in the LED menu once it boots.",
-                                      text_color="gray60")
+                                      text_color=COLORS["muted_text"])
             self.ctx.status("Badge restarting (hard reset)")
         self.ctx.run_device_task(self.ctx.badge.reset, done, title="Hard reset")
 

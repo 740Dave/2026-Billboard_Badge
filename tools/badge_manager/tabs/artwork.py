@@ -19,13 +19,15 @@ import customtkinter as ctk
 from PIL import Image
 
 from core import artwork_convert as ac
+from core import theme
+from core.theme import COLORS
 from tabs.base import BaseTab, Section, confirm, info, human_size
 
 ART_DIR = "/data/artwork"
 GALLERY_DIR = "/data/gallery"
 INDEX_FILE = "/data/artwork_index"
 BADGE_APP = "/apps/artwork.py"
-LOCAL_APP = Path(__file__).resolve().parents[3] / "user_apps" / "artwork" / "apps" / "artwork.py"
+LOCAL_APP = Path(__file__).resolve().parents[2] / "artwork_app" / "badge" / "apps" / "artwork.py"
 
 THUMB = (176, 123)          # 960x672 scaled
 PREVIEW = (336, 235)
@@ -204,10 +206,10 @@ class ArtworkTab(BaseTab):
 
         self.grid_frame = ctk.CTkScrollableFrame(left.body)
         self.grid_frame.pack(fill="both", expand=True, pady=6)
-        self.empty_label = ctk.CTkLabel(self.grid_frame, text="Not loaded yet.", text_color="gray60")
+        self.empty_label = ctk.CTkLabel(self.grid_frame, text="Not loaded yet.", text_color=COLORS["muted_text"])
         self.empty_label.grid(row=0, column=0, padx=10, pady=10)
 
-        self.repair_bar = ctk.CTkFrame(left.body, fg_color=("#f6dddd", "#4a2222"))
+        self.repair_bar = ctk.CTkFrame(left.body, fg_color=COLORS["danger_bg"])
         self.repair_label = ctk.CTkLabel(self.repair_bar, text="", anchor="w", justify="left")
         self.repair_label.pack(side="left", padx=8, pady=4, fill="x", expand=True)
         self.repair_btn = ctk.CTkButton(self.repair_bar, text="Repair names", width=110, command=self._repair)
@@ -221,7 +223,7 @@ class ArtworkTab(BaseTab):
         self.btn_down = ctk.CTkButton(acts, text="Move down", width=90, command=lambda: self._move(+1))
         self.btn_next = ctk.CTkButton(acts, text="Show this next", width=110, command=self._show_next)
         self.btn_save = ctk.CTkButton(acts, text="Save copy…", width=90, command=self._save_copy)
-        self.btn_del = ctk.CTkButton(acts, text="Delete", width=70, fg_color="#a33", hover_color="#822",
+        self.btn_del = ctk.CTkButton(acts, text="Delete", width=70, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                                      command=self._delete)
         for b in (self.btn_up, self.btn_down, self.btn_next, self.btn_save, self.btn_del):
             b.pack(side="left", padx=(0, 6))
@@ -235,10 +237,11 @@ class ArtworkTab(BaseTab):
         pick.pack(fill="x")
         ctk.CTkButton(pick, text="Choose images…", command=self._choose_files).pack(side="left")
         ctk.CTkButton(pick, text="Add folder…", width=100, command=self._choose_folder).pack(side="left", padx=6)
-        ctk.CTkButton(pick, text="Remove", width=70, fg_color="gray40", command=self._remove_source).pack(
+        ctk.CTkButton(pick, text="Remove", width=70, command=self._remove_source).pack(
             side="left")
 
         self.src_list = tk.Listbox(rb, height=5, exportselection=False, activestyle="none")
+        theme.style_listbox(self.src_list)
         self.src_list.pack(fill="x", pady=6)
         self.src_list.bind("<<ListboxSelect>>", self._source_selected)
 
@@ -257,7 +260,7 @@ class ArtworkTab(BaseTab):
             row=1, column=0, sticky="w", pady=2)
         ctk.CTkCheckBox(opts, text="Use red", variable=self.red_var, command=self._opts_changed).grid(
             row=1, column=1, sticky="w", pady=2)
-        ctk.CTkButton(opts, text="Apply options to all", width=140, fg_color="gray40",
+        ctk.CTkButton(opts, text="Apply options to all", width=140,
                       command=self._apply_all).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
 
         prev = ctk.CTkFrame(rb, fg_color="transparent")
@@ -284,7 +287,7 @@ class ArtworkTab(BaseTab):
         bottom.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         self.status_label = ctk.CTkLabel(bottom, text="Badge: not read yet", anchor="w")
         self.status_label.pack(side="left", padx=10, pady=6)
-        self.restart_btn = ctk.CTkButton(bottom, text="Restart badge", width=110, fg_color="gray40",
+        self.restart_btn = ctk.CTkButton(bottom, text="Restart badge", width=110,
                                          command=self._restart)
         self.restart_btn.pack(side="right", padx=6)
         self.install_btn = ctk.CTkButton(bottom, text="Install Artwork app", width=140, command=self._install_app)
@@ -427,8 +430,9 @@ class ArtworkTab(BaseTab):
             img = self.thumb_imgs.get(f"{self.folder}/{name}:{size}")
             label = f"{i + 1}. {name if len(name) <= 24 else name[:21] + '…'}\n{human_size(size)}"
             b = ctk.CTkButton(self.grid_frame, text=label, image=img, compound="top",
-                              width=THUMB[0] + 8, height=THUMB[1] + 40, fg_color="gray25",
-                              hover_color="gray35", border_width=3, border_color="gray25",
+                              width=THUMB[0] + 8, height=THUMB[1] + 40, fg_color=COLORS["tile"],
+                              hover_color=COLORS["tile_hover"], border_width=3, border_color=COLORS["tile"],
+                              text_color=COLORS["text"],
                               command=lambda n=name: self._select(n))
             b.grid(row=i // GRID_COLS, column=i % GRID_COLS, padx=4, pady=4)
             self.thumb_btns[name] = b
@@ -438,8 +442,9 @@ class ArtworkTab(BaseTab):
             img = self.thumb_imgs.get(f"{self.folder}/{name}:{size}")
             label = f"hidden: {shown if len(shown) <= 20 else shown[:17] + '…'}\n{human_size(size)}"
             b = ctk.CTkButton(self.grid_frame, text=label, image=img, compound="top", state="disabled",
-                              width=THUMB[0] + 8, height=THUMB[1] + 40, fg_color="#4a2222",
-                              border_width=3, border_color="#a33", text_color_disabled=("gray20", "gray80"))
+                              width=THUMB[0] + 8, height=THUMB[1] + 40, fg_color=COLORS["danger_bg"],
+                              border_width=3, border_color=COLORS["danger"],
+                              text_color_disabled=COLORS["muted_text"])
             b.grid(row=i // GRID_COLS, column=i % GRID_COLS, padx=4, pady=4)
             self.thumb_btns[name] = b
         if self.leftovers:
@@ -461,7 +466,7 @@ class ArtworkTab(BaseTab):
 
     def _highlight(self) -> None:
         for n, b in self.thumb_btns.items():
-            b.configure(border_color="#d22" if n == self.selected else "gray25")
+            b.configure(border_color=COLORS["accent_text"] if n == self.selected else COLORS["tile"])
         if self.selected:
             idx = self._names().index(self.selected)
             size = dict(self.badge_files)[self.selected]
@@ -488,10 +493,10 @@ class ArtworkTab(BaseTab):
             text=f"{len(self.badge_files)} {where} image(s), {human_size(total)} on badge  ·  "
                  f"free space {human_size(self._fs_free)}")
         if self._app_installed:
-            self.app_label.configure(text="Artwork app installed ✓", text_color=("green4", "lightgreen"))
+            self.app_label.configure(text="Artwork app installed ✓", text_color=COLORS["success_text"])
             self.install_btn.pack_forget()
         else:
-            self.app_label.configure(text="apps/artwork.py not on badge", text_color=("#a33", "#f77"))
+            self.app_label.configure(text="apps/artwork.py not on badge", text_color=COLORS["danger_text"])
             self.install_btn.pack(side="right", padx=6, before=self.app_label)
 
     # ============================================================== actions

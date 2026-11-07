@@ -22,6 +22,9 @@ from tkinter import filedialog, ttk
 
 import customtkinter as ctk
 
+from core import theme
+from core.theme import COLORS
+
 from .base import BaseTab, Section, confirm, human_size, info
 
 PROTECTED = ("/", "/apps", "/lib", "/data")
@@ -217,14 +220,15 @@ class DeviceTab(BaseTab):
         bar = ctk.CTkFrame(b, fg_color="transparent")
         bar.pack(fill="x", pady=(0, 4))
         for text, cmd, w in [("Refresh", self.refresh_files, 70), ("View", self.view_selected, 60),
-                             ("Download…", self.download_selected, 90), ("Upload…", self.upload_to_selected, 80)]:
+                             ("Download…", self.download_selected, 90)]:
             ctk.CTkButton(bar, text=text, width=w, command=cmd).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(bar, text="Delete…", width=70, fg_color="#a33", hover_color="#822",
+        ctk.CTkButton(bar, text="Upload…", width=80, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
+                      command=self.upload_to_selected).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(bar, text="Delete…", width=70, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                       command=self.delete_selected).pack(side="right")
 
         wrap = tk.Frame(b)
         wrap.pack(fill="both", expand=True)
-        self._style_tree()
         self.tree = ttk.Treeview(wrap, columns=("size",), selectmode="extended", style="Badge.Treeview")
         self.tree.heading("#0", text="Path", anchor="w")
         self.tree.heading("size", text="Size", anchor="e")
@@ -234,17 +238,10 @@ class DeviceTab(BaseTab):
         self.tree.configure(yscrollcommand=ysb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
+        theme.style_treeview(self.tree, "Badge.Treeview", rowheight=22)
         self.tree.bind("<Double-1>", lambda _e: self.view_selected())
         self.files_info = ctk.CTkLabel(b, text="", anchor="w")
         self.files_info.pack(fill="x", pady=(4, 0))
-
-    def _style_tree(self) -> None:
-        st = ttk.Style(self)
-        dark = ctk.get_appearance_mode() == "Dark"
-        bg, fg, sel = ("#2b2b2b", "#dddddd", "#1f538d") if dark else ("#ffffff", "#111111", "#3a7ebf")
-        st.configure("Badge.Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=22,
-                     borderwidth=0)
-        st.map("Badge.Treeview", background=[("selected", sel)], foreground=[("selected", "#ffffff")])
 
     def _clear_tree(self) -> None:
         self.entries = {}
@@ -458,10 +455,10 @@ class DeviceTab(BaseTab):
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.pack(fill="x")
         ctk.CTkButton(row, text="Back up entire badge", command=self.backup_now).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(row, text="Restore from backup…", fg_color="gray40",
+        ctk.CTkButton(row, text="Restore from backup…", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                       command=self.restore_from).pack(side="left")
         ctk.CTkLabel(b, text=WIFI_NOTE, anchor="w", justify="left", wraplength=380,
-                     text_color=("#a05a00", "#f0b050")).pack(fill="x", pady=(4, 0))
+                     text_color=COLORS["warning_text"]).pack(fill="x", pady=(4, 0))
         self.backup_msg = ctk.CTkLabel(b, text="", anchor="w", justify="left", wraplength=380)
         self.backup_msg.pack(fill="x", pady=(6, 0))
         self.restore_bar = ctk.CTkProgressBar(b, height=8)
@@ -469,7 +466,7 @@ class DeviceTab(BaseTab):
         hdr = ctk.CTkFrame(b, fg_color="transparent")
         hdr.pack(fill="x", pady=(6, 2))
         ctk.CTkLabel(hdr, text="Recent backups", anchor="w", font=ctk.CTkFont(weight="bold")).pack(side="left")
-        ctk.CTkButton(hdr, text="Open folder", width=90, fg_color="gray40",
+        ctk.CTkButton(hdr, text="Open folder", width=90,
                       command=lambda: self.open_in_finder(self.backup_dir)).pack(side="right")
         self.backup_list = ctk.CTkScrollableFrame(b, height=90)
         self.backup_list.pack(fill="both", expand=True)
@@ -495,9 +492,9 @@ class DeviceTab(BaseTab):
             r = ctk.CTkFrame(self.backup_list, fg_color="transparent")
             r.pack(fill="x")
             ctk.CTkLabel(r, text=p.name, anchor="w").pack(side="left")
-            ctk.CTkButton(r, text="Restore", width=60, height=22, fg_color="gray40",
+            ctk.CTkButton(r, text="Restore", width=60, height=22, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                           command=lambda p=p: self.restore_from(str(p))).pack(side="right", padx=2)
-            ctk.CTkButton(r, text="Show", width=50, height=22, fg_color="gray40",
+            ctk.CTkButton(r, text="Show", width=50, height=22,
                           command=lambda p=p: self.open_in_finder(p)).pack(side="right", padx=2)
 
     def open_in_finder(self, path) -> None:
@@ -627,13 +624,13 @@ class DeviceTab(BaseTab):
                           ("I2C / SAO scan", lambda: self.run_lab("I2C scan", I2C_SCAN)),
                           ("Battery / USB voltage", self.read_voltage)]:
             ctk.CTkButton(top, text=text, width=150, command=cmd).pack(side="left", padx=(0, 6))
-        self.reset_btn = ctk.CTkButton(top, text="Restore badge UI (hard reset)", fg_color="#c0392b",
-                                       hover_color="#962d22", font=ctk.CTkFont(weight="bold"),
+        self.reset_btn = ctk.CTkButton(top, text="Restore badge UI (hard reset)",
+                                       font=ctk.CTkFont(weight="bold"),
                                        command=self.hard_reset)
         self.reset_btn.pack(side="right")
 
         self.lab_warn = ctk.CTkLabel(
-            b, anchor="w", justify="left", text_color=("#a05a00", "#f0b050"),
+            b, anchor="w", justify="left", text_color=COLORS["warning_text"],
             text="Experiments stop the badge's own screen/UI loop. Click \"Restore badge UI\" when you're done.")
         self.lab_warn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 4))
 
@@ -652,7 +649,7 @@ class DeviceTab(BaseTab):
         hdr2 = ctk.CTkFrame(right, fg_color="transparent")
         hdr2.pack(fill="x")
         ctk.CTkLabel(hdr2, text="Output", anchor="w").pack(side="left")
-        ctk.CTkButton(hdr2, text="Clear", width=60, fg_color="gray40",
+        ctk.CTkButton(hdr2, text="Clear", width=60,
                       command=lambda: self._set_output("")).pack(side="right")
         self.output = ctk.CTkTextbox(right, height=110, font=ctk.CTkFont(family="Menlo", size=12))
         self.output.pack(fill="both", expand=True)
@@ -669,7 +666,7 @@ class DeviceTab(BaseTab):
     def _set_interrupted(self, flag: bool) -> None:
         # The top bar shows the global "Hard reset" reminder; here we only tint the Lab hint.
         self.ui_interrupted = flag
-        self.lab_warn.configure(text_color=("#b00020", "#ff6b6b") if flag else ("#a05a00", "#f0b050"))
+        self.lab_warn.configure(text_color=COLORS["danger_text"] if flag else COLORS["warning_text"])
 
     def _remind_reset(self, what: str) -> None:
         self._set_interrupted(True)

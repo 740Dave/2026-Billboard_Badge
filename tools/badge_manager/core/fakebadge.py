@@ -1,7 +1,7 @@
 """FakeBadgeService: a simulated badge for testing the GUI without hardware.
 
 Enable with:  BADGE_FAKE=1 .venv/bin/python app.py
-The "badge filesystem" is a temp folder seeded from upstream firmware/badge (the upstream remote's main).
+The "badge filesystem" is a temp folder seeded from upstream firmware/badge (origin/main).
 Same public methods as BadgeService. exec_py/exec_json only understand nothing: they raise,
 except info(), which is simulated. Slight delays mimic the real serial link.
 """
@@ -30,8 +30,7 @@ class FakeBadgeService:
         if repo_dir:
             from .sources import SourceManager
             try:
-                sm = SourceManager(repo_dir)
-                sm.export_badge_tree(sm.upstream_ref, self.root)
+                SourceManager(repo_dir).export_badge_tree("origin/main", self.root)
             except Exception as e:  # noqa: BLE001
                 log(f"fake badge: could not seed from repo: {e}")
         (self.root / "data").mkdir(exist_ok=True)

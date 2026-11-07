@@ -12,42 +12,15 @@ import json
 import re
 import subprocess
 import tarfile
+import threading
 import io
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 UPSTREAM = "Hack-a-Day/2026-Billboard_Badge"
-# The git remote that points at the official Hack-a-Day repo. In a plain clone of upstream
-# that's "origin"; in a clone of a personal fork, origin is the fork and upstream is usually
-# "upstream". SourceManager detects it (see detect_upstream_remote) and updates these.
 UPSTREAM_REMOTE = "origin"
 UPSTREAM_REF = "origin/main"
-
-
-def detect_upstream_remote(repo_dir: str | Path) -> str:
-    """Name of the remote whose URL contains Hack-a-Day/2026-Billboard_Badge (fallback "origin")."""
-    try:
-        cp = subprocess.run(["git", "-C", str(repo_dir), "remote", "-v"], capture_output=True,
-                            text=True, timeout=30)
-    except Exception:  # noqa: BLE001
-        return "origin"
-    if cp.returncode != 0:
-        return "origin"
-    names = []
-    for line in cp.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and UPSTREAM.lower() in parts[1].lower() and parts[0] not in names:
-            names.append(parts[0])
-    if not names:
-        return "origin"
-    return "origin" if "origin" in names else names[0]
-
-
-def _set_upstream_remote(remote: str) -> None:
-    global UPSTREAM_REMOTE, UPSTREAM_REF
-    UPSTREAM_REMOTE = remote
-    UPSTREAM_REF = f"{remote}/main"
 BADGE_SUBDIR = "firmware/badge"          # mirrors the badge's / filesystem
 
 
@@ -103,16 +76,11 @@ class SourceManager:
         self.repo = Path(repo_dir)
         self.log = log
         self.token = github_token
-        self.detect_upstream()
-
-    def detect_upstream(self) -> str:
-        """Find the official repo's remote and point UPSTREAM_REMOTE/UPSTREAM_REF at it."""
-        _set_upstream_remote(detect_upstream_remote(self.repo) if (self.repo / ".git").exists() else "origin")
-        return UPSTREAM_REMOTE
-
-    @property
-    def upstream_ref(self) -> str:
-        return UPSTREAM_REF
+        # Guards network operations that mutate the cache (sync_remotes / fetch_all) so a manual
+        # fetch and the background UpdatePoller never run git fetch concurrently. Re-entrant: a
+        # caller may hold it across several calls (``with src.lock: ...``) and still call these.
+        # Use ``src.lock.acquire(blocking=False)`` to skip instead of waiting when busy.
+        self.lock = threading.RLock()
 
     # ---------------------------------------------------------------- git
     def git(self, *args: str, timeout: float = 300, check: bool = True, binary: bool = False):
@@ -130,7 +98,6 @@ class SourceManager:
         self.repo.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", f"https://github.com/{UPSTREAM}.git", str(self.repo)],
                        check=True, capture_output=True, timeout=600)
-        self.detect_upstream()
 
     # ------------------------------------------------------------- forks
     def github_forks(self) -> list[dict]:
@@ -151,6 +118,10 @@ class SourceManager:
 
     def sync_remotes(self) -> int:
         """Add a git remote for each fork that doesn't have one yet. Returns how many were added."""
+        with self.lock:
+            return self._sync_remotes()
+
+    def _sync_remotes(self) -> int:
         existing = set(self.git("remote").split())
         added = 0
         for f in self.github_forks():
@@ -161,7 +132,8 @@ class SourceManager:
         return added
 
     def fetch_all(self) -> str:
-        return self.git("fetch", "--all", "--prune", "--jobs=8", timeout=900)
+        with self.lock:
+            return self.git("fetch", "--all", "--prune", "--jobs=8", timeout=900)
 
     def remote_repo(self, remote: str) -> str:
         url = self.git("remote", "get-url", remote, check=False).strip()
@@ -198,8 +170,7 @@ class SourceManager:
         out = self.git("log", f"-{n}", "--format=%H|%ad|%an|%s", "--date=short", *rng)
         return [Commit(*l.split("|", 3)) for l in out.splitlines()]
 
-    def diff_stat(self, ref: str, base: str | None = None) -> str:
-        base = base or UPSTREAM_REF
+    def diff_stat(self, ref: str, base: str = UPSTREAM_REF) -> str:
         return self.git("diff", "--stat=100", f"{base}...{ref}")
 
     def show_file(self, ref: str, path: str) -> bytes:

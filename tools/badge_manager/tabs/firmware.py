@@ -16,12 +16,13 @@ from pathlib import Path
 
 import customtkinter as ctk
 
-from core import sources as _sources
+from core.theme import COLORS
 
 from .base import BaseTab, Section, confirm, info, human_size
 
 BADGE_PREFIX = "firmware/badge/"
 BIN_PREFIX = "firmware/bin/"
+UPSTREAM_REF = "origin/main"
 FLASH_SIZE = "0x800000"          # 8 MB
 RUNTIME_FILES = (("0x0", "bootloader.bin"), ("0x8000", "partition-table.bin"),
                  ("0x10000", "micropython.bin"))
@@ -29,8 +30,14 @@ FACTORY_FILE = "supercon26_factory.bin"
 PROTECT = ("/data", "/apps", "/lib")   # never deleted by "delete files not in this version"
 
 MONO = ("Menlo", 12)
-SEL_COLOR = ("#3a7ebf", "#1f538d")
-ROW_COLOR = ("gray86", "gray20")
+SEL_COLOR = COLORS["selection"]
+ROW_COLOR = COLORS["row"]
+
+
+def _row_text(sel: bool, dim: bool):
+    if sel:
+        return COLORS["text_on_accent"]
+    return COLORS["muted_text"] if dim else COLORS["text"]
 
 BOOTLOADER_HELP = (
     "Put the badge in BOOTLOADER mode first:\n"
@@ -204,7 +211,7 @@ class FirmwareTab(BaseTab):
         self.badge_only_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(left.body, text="Only forks that change badge files", variable=self.badge_only_var,
                         command=self.render_list).pack(anchor="w", pady=(6, 2))
-        self.count_label = ctk.CTkLabel(left.body, text="", anchor="w", text_color="gray55")
+        self.count_label = ctk.CTkLabel(left.body, text="", anchor="w", text_color=COLORS["muted_text"])
         self.count_label.pack(fill="x")
         self.list_frame = ctk.CTkScrollableFrame(left.body, width=350)
         self.list_frame.pack(fill="both", expand=True, pady=(4, 0))
@@ -220,7 +227,7 @@ class FirmwareTab(BaseTab):
         self.gh_btn = ctk.CTkButton(head, text="Open on GitHub", width=130, state="disabled",
                                     command=self.open_github)
         self.gh_btn.pack(side="right")
-        self.meta_label = ctk.CTkLabel(right, text="", anchor="w", justify="left", text_color="gray55")
+        self.meta_label = ctk.CTkLabel(right, text="", anchor="w", justify="left", text_color=COLORS["muted_text"])
         self.meta_label.pack(fill="x", padx=10)
 
         self.pages = ctk.CTkTabview(right)
@@ -252,7 +259,7 @@ class FirmwareTab(BaseTab):
                                          command=self.compare_with_badge, state="disabled")
         self.compare_btn.pack(side="left")
         self.install_btn = ctk.CTkButton(bar, text="Install to badge", width=150, state="disabled",
-                                         fg_color="#2f8f4e", hover_color="#25703d",
+                                         fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                                          command=self.install)
         self.install_btn.pack(side="left", padx=8)
         self.delete_var = ctk.BooleanVar(value=False)
@@ -274,7 +281,7 @@ class FirmwareTab(BaseTab):
         self.progress_label.pack(side="left")
 
     def _build_runtime(self, page) -> None:
-        warn = ctk.CTkLabel(page, anchor="w", justify="left", text_color=("#a35d00", "#e0a040"),
+        warn = ctk.CTkLabel(page, anchor="w", justify="left", text_color=COLORS["warning_text"],
                             text=("ADVANCED: these write the ESP32-S3 flash with esptool. Normal updates only need "
                                   "'Compare & install'.\nFlashing the runtime keeps the badge filesystem; restoring the "
                                   "factory image ERASES it (including /data)."))
@@ -286,14 +293,14 @@ class FirmwareTab(BaseTab):
         bar.pack(fill="x", pady=(8, 0))
         self.rt_buttons = [
             ctk.CTkButton(bar, text="Back up full flash (read 8 MB)", command=self.backup_flash),
-            ctk.CTkButton(bar, text="Flash MicroPython runtime", fg_color="#b5651d", hover_color="#8f4f16",
+            ctk.CTkButton(bar, text="Flash MicroPython runtime", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                           command=self.flash_runtime),
-            ctk.CTkButton(bar, text="Restore factory image", fg_color="#a83232", hover_color="#842727",
+            ctk.CTkButton(bar, text="Restore factory image", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                           command=self.restore_factory),
         ]
         for b in self.rt_buttons:
             b.pack(side="left", padx=(0, 8))
-        self.rt_label = ctk.CTkLabel(page, text="", anchor="w", text_color="gray55")
+        self.rt_label = ctk.CTkLabel(page, text="", anchor="w", text_color=COLORS["muted_text"])
         self.rt_label.pack(fill="x", pady=(6, 0))
 
     # ---------------------------------------------------------------- helpers
@@ -420,8 +427,8 @@ class FirmwareTab(BaseTab):
         if idle:
             arrow = "v" if self.show_unchanged else ">"
             ctk.CTkButton(self.list_frame, text=f"{arrow}  Forks with no new commits ({len(idle)})",
-                          anchor="w", fg_color="transparent", text_color="gray55",
-                          hover_color=ROW_COLOR, command=self._toggle_unchanged)\
+                          anchor="w", fg_color="transparent", text_color=COLORS["muted_text"],
+                          hover_color=COLORS["row_hover"], command=self._toggle_unchanged)\
                 .pack(fill="x", pady=(8, 2))
             if self.show_unchanged:
                 for r in idle:
@@ -454,10 +461,11 @@ class FirmwareTab(BaseTab):
         sel = self.selected is not None and self.selected.name == r.name
         b = ctk.CTkButton(self.list_frame, text=f"{line1}\n{line2}", anchor="w", height=56,
                           fg_color=SEL_COLOR if sel else ROW_COLOR,
-                          text_color=("gray45", "gray55") if dim and not sel else ("gray10", "gray92"),
-                          hover_color=("gray78", "gray28"),
+                          text_color=_row_text(sel, dim),
+                          hover_color=COLORS["row_hover"],
                           command=lambda r=r: self.select(r))
         b.pack(fill="x", pady=2)
+        b._dim = dim
         self._row_widgets[r.name] = b
 
     # ---------------------------------------------------------------- detail
@@ -465,7 +473,9 @@ class FirmwareTab(BaseTab):
         prev = self.selected.name if self.selected else None
         self.selected = r
         for name, b in self._row_widgets.items():
-            b.configure(fg_color=SEL_COLOR if name == r.name else ROW_COLOR)
+            sel = name == r.name
+            b.configure(fg_color=SEL_COLOR if sel else ROW_COLOR,
+                        text_color=_row_text(sel, getattr(b, "_dim", False)))
         self.title_label.configure(text=r.name + ("   (official upstream)" if r.is_upstream else ""))
         meta = f"{r.sha[:10]}  ·  {_fmt_date(r.date)}  ·  {r.author}  ·  {r.subject}"
         if not r.is_upstream:
@@ -486,7 +496,7 @@ class FirmwareTab(BaseTab):
 
         def work():
             commits = src.log_commits(name, n=50, only_unique=not r.is_upstream)
-            stat = "" if r.is_upstream else src.git("diff", "--stat=100", f"{_sources.UPSTREAM_REF}...{name}",
+            stat = "" if r.is_upstream else src.git("diff", "--stat=100", f"{UPSTREAM_REF}...{name}",
                                                        "--", BADGE_PREFIX.rstrip("/"))
             bins = self._bin_info(name)
             return commits, stat, bins
@@ -529,13 +539,13 @@ class FirmwareTab(BaseTab):
                 out[Path(path).name] = (blob, int(size) if size.isdigit() else None)
             return out
         mine = tree(name)
-        ups = tree(_sources.UPSTREAM_REF) if name != _sources.UPSTREAM_REF else mine
+        ups = tree(UPSTREAM_REF) if name != UPSTREAM_REF else mine
         if not mine:
             return f"{name} has no firmware/bin folder."
         lines = [f"Runtime images in {name}:firmware/bin", ""]
         for fn, (blob, size) in sorted(mine.items()):
             note = ""
-            if name != _sources.UPSTREAM_REF:
+            if name != UPSTREAM_REF:
                 u = ups.get(fn)
                 note = "same as upstream" if u and u[0] == blob else ("NEW in this fork" if not u
                                                                       else "DIFFERENT from upstream")
@@ -738,7 +748,7 @@ class FirmwareTab(BaseTab):
         return (ans or "").strip().upper() == word
 
     def _runtime_ref(self) -> str:
-        return self.selected.name if self.selected else _sources.UPSTREAM_REF
+        return self.selected.name if self.selected else UPSTREAM_REF
 
     def _set_rt_busy(self, busy: bool, text: str = "") -> None:
         for b in self.rt_buttons:

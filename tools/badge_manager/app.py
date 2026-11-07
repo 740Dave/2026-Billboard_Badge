@@ -16,6 +16,10 @@ import customtkinter as ctk
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.context import AppContext  # noqa: E402
+from core import theme  # noqa: E402
+from core.theme import COLORS  # noqa: E402
+from core.updates import UpdatePoller  # noqa: E402
+from core.update_ui import UpdateIndicator  # noqa: E402
 
 # (module, class). Order = tab order. A tab that fails to import shows its error instead of
 # taking the whole app down, which matters while forks and features change daily.
@@ -24,7 +28,7 @@ TABS = [
     ("tabs.firmware", "FirmwareTab"),
     ("tabs.apps", "AppsTab"),
     ("tabs.artwork", "ArtworkTab"),
-    ("tabs.nerd", "NerdTab"),
+    ("tabs.maker", "MakerTab"),
     ("tabs.settings", "SettingsTab"),
 ]
 
@@ -38,10 +42,9 @@ class ConnectionBar(ctk.CTkFrame):
         self.port_menu.pack(side="left", padx=4)
         ctk.CTkButton(self, text="Rescan", width=70, command=self.rescan).pack(side="left", padx=4)
         ctk.CTkButton(self, text="Connect", width=80, command=self.connect).pack(side="left", padx=4)
-        self.reset_btn = ctk.CTkButton(self, text="Hard reset", width=90, fg_color="gray40",
-                                       command=self.hard_reset)
+        self.reset_btn = ctk.CTkButton(self, text="Hard reset", width=90, command=self.hard_reset)
         self.reset_btn.pack(side="left", padx=4)
-        self.state = ctk.CTkLabel(self, text="● not connected", text_color="gray60")
+        self.state = ctk.CTkLabel(self, text="● not connected", text_color=COLORS["muted_text"])
         self.state.pack(side="left", padx=12)
         self.busy = ctk.CTkProgressBar(self, mode="indeterminate", width=120)
         self.busy_label = ctk.CTkLabel(self, text="")
@@ -50,7 +53,7 @@ class ConnectionBar(ctk.CTkFrame):
         ctx.events.subscribe("busy", self._on_busy)
         ctx.events.subscribe("badge.ui_interrupted", self._on_interrupted)
         ctx.events.subscribe("badge.connected", self._on_connected)
-        ctx.events.subscribe("badge.disconnected", lambda _: self._set_state("● not connected", "gray60"))
+        ctx.events.subscribe("badge.disconnected", lambda _: self._set_state("● not connected", COLORS["muted_text"]))
         self.rescan()
 
     def rescan(self):
@@ -79,9 +82,11 @@ class ConnectionBar(ctk.CTkFrame):
 
     def _on_interrupted(self, paused):
         if paused:
-            self.reset_btn.configure(text="Hard reset ⚠ badge paused", width=190, fg_color="#c8641e")
+            self.reset_btn.configure(text="Hard reset ⚠ badge paused", width=190, fg_color=COLORS["warning"],
+                                     hover_color=COLORS["warning_hover"])
         else:
-            self.reset_btn.configure(text="Hard reset", width=90, fg_color="gray40")
+            self.reset_btn.configure(text="Hard reset", width=90, fg_color=COLORS["accent"],
+                                     hover_color=COLORS["accent_hover"])
 
     def connect(self):
         def done(info):
@@ -99,7 +104,7 @@ class ConnectionBar(ctk.CTkFrame):
     def _on_connected(self, info):
         v = info.get("vin")
         vtxt = f"  ·  {v:.2f} V" if v else ""
-        self._set_state(f"● connected  ·  MicroPython {info.get('release', '?')}{vtxt}", "#3ba55d")
+        self._set_state(f"● connected  ·  MicroPython {info.get('release', '?')}{vtxt}", COLORS["success_text"])
 
     def _set_state(self, text, color):
         self.state.configure(text=text, text_color=color)
@@ -118,8 +123,10 @@ class ConnectionBar(ctk.CTkFrame):
 
 class App(ctk.CTk):
     def __init__(self):
+        from core.config import Config
+        theme.apply_theme(Config())   # must run before the root window exists
         super().__init__()
-        self.title("Billboard Badge Manager")
+        self.title("2026 Hackaday Billboard Badge Manager")
         self.geometry("1280x860")
         self.minsize(1050, 700)
 
@@ -130,15 +137,21 @@ class App(ctk.CTk):
         self.log_box.configure(state="disabled")
 
         self.ctx = AppContext(self, self._append_log, lambda m: self.status_label.configure(text=m))
-        ctk.set_appearance_mode(self.ctx.config.get("appearance"))
 
-        ConnectionBar(self, self.ctx).pack(fill="x", padx=10, pady=(10, 4))
+        self.conn_bar = ConnectionBar(self, self.ctx)
+        self.conn_bar.pack(fill="x", padx=10, pady=(10, 4))
 
         self.tabview = ctk.CTkTabview(self, command=self._tab_changed)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=4)
         self.tabs = {}
         for mod, cls in TABS:
             self._add_tab(mod, cls)
+
+        # Poll every fork for firmware/app updates: at launch, then every 15 minutes.
+        self.updates = UpdatePoller(self.ctx, interval_s=900)
+        UpdateIndicator(self.conn_bar, self.ctx, self.updates).pack(side="right", padx=8)
+        self.updates.start()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         bottom.pack(fill="x", padx=10, pady=(0, 10))
         bar = ctk.CTkFrame(bottom, fg_color="transparent")
@@ -151,6 +164,17 @@ class App(ctk.CTk):
                       command=self._toggle_log).pack(side="right", padx=4, pady=2)
         self.log_box.pack(fill="x", padx=4, pady=(0, 4))
         self._tab_changed()
+
+        # First-run wizard (name, what you make, Maker Detector); also offers the profile
+        # to badges as they connect.
+        from core.onboarding import maybe_run_onboarding
+        self.after(400, lambda: maybe_run_onboarding(self, self.ctx))
+
+    def _on_close(self):
+        try:
+            self.updates.stop()
+        finally:
+            self.destroy()
 
     def _add_tab(self, mod, cls):
         try:

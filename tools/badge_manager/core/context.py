@@ -8,8 +8,9 @@
     ctx.events      tiny pub/sub; callbacks always run on the Tk main thread
 
 Threading model (Tk is single-threaded):
-    ctx.run_task(fn, on_done=None, on_error=None, title="...")
+    ctx.run_task(fn, on_done=None, on_error=None, title="...", quiet=False)
         runs fn() on a background thread; on_done(result) / on_error(exc) run on the Tk thread.
+        quiet=True: no busy spinner / status-bar text (for background polling); errors still log.
     ctx.run_device_task(fn, ...)
         same, but on the single DEVICE worker so badge operations never overlap
         (the serial port is exclusive). Also shows a busy indicator.
@@ -22,6 +23,15 @@ Standard events (publish with ctx.events.publish(name, payload)):
     "badge.files_changed"   payload: list of changed badge paths (after any push/remove)
     "sources.updated"   payload: list[Ref]
     "busy"              payload: (bool busy, str title)
+    "updates.checking"  payload: bool. True while the background UpdatePoller (core.updates) checks forks.
+    "updates.found"     payload: dict from UpdatePoller after each check:
+                        {checked_at: float epoch, baseline: bool (first-ever run, lists empty),
+                         totals: {forks, refs, apps}, new_forks: [{remote, repo}],
+                         changed_refs: [{name, old, new, is_new, subject, author, date, ahead, behind,
+                                         firmware_changed: bool, files: [paths]}],
+                         new_apps: [{module, title, refs}], changed_apps: [{module, title, refs}],
+                         error: str | None (GitHub API/fetch problem; check still ran what it could)}
+    "profile.changed"   payload: config "profile" dict, after it is saved (Settings > User Settings, wizard)
     "badge.ui_interrupted"  payload: bool. True after any badge command (main.py is stopped, the
                         badge menu is frozen) until a hard reset. The top bar offers the reset.
 """
@@ -104,27 +114,30 @@ class AppContext:
         self.events.publish("busy", (self._busy > 0, title))
 
     # -------------------------------------------------------------- tasks
-    def _wrap(self, fn, on_done, on_error, title):
+    def _wrap(self, fn, on_done, on_error, title, quiet=False):
         def run():
             try:
                 res = fn()
             except Exception as e:  # noqa: BLE001
                 self.log(f"ERROR in {title}: {e}")
                 self.log(traceback.format_exc(limit=3))
-                self.status(f"{title}: failed - {e}")
+                if not quiet:
+                    self.status(f"{title}: failed - {e}")
                 if on_error:
                     self.ui(on_error, e)
             else:
                 if on_done:
                     self.ui(on_done, res)
             finally:
-                self.ui(self._set_busy, -1, title)
+                if not quiet:
+                    self.ui(self._set_busy, -1, title)
         return run
 
-    def run_task(self, fn, on_done=None, on_error=None, title: str = "task") -> None:
-        self._set_busy(+1, title)
-        self.status(f"{title}...")
-        threading.Thread(target=self._wrap(fn, on_done, on_error, title), daemon=True).start()
+    def run_task(self, fn, on_done=None, on_error=None, title: str = "task", quiet: bool = False) -> None:
+        if not quiet:
+            self._set_busy(+1, title)
+            self.status(f"{title}...")
+        threading.Thread(target=self._wrap(fn, on_done, on_error, title, quiet), daemon=True).start()
 
     def run_device_task(self, fn, on_done=None, on_error=None, title: str = "badge") -> None:
         if not self.badge.port:
