@@ -24,6 +24,7 @@ TABS = [
     ("tabs.firmware", "FirmwareTab"),
     ("tabs.apps", "AppsTab"),
     ("tabs.artwork", "ArtworkTab"),
+    ("tabs.nerd", "NerdTab"),
     ("tabs.settings", "SettingsTab"),
 ]
 
