@@ -171,16 +171,37 @@ class FakeBadgeService:
 
     _copy_order = staticmethod(lambda p: __import__("core.badge", fromlist=["x"]).BadgeService._copy_order(p))
 
-    def backup(self, dest_dir):
-        import datetime
-        dest = Path(dest_dir) / datetime.datetime.now().strftime("badge-%Y%m%d-%H%M%S")
-        shutil.copytree(self.root, dest)
-        return dest
+    # Backups run the real BadgeService.backup() logic on top of a simulated "mpremote fs cp".
+    # Tests can set cp_drop = {badge paths}: those are skipped on the next copy attempt only.
+    cp_drop: set = set()
 
-    def reset(self):
+    def walk(self, root="/"):
+        return self.listdir(root, recursive=True)
+
+    def _run(self, *args, timeout=60, check=True):
+        if args[:2] != ("fs", "cp") or not args[-1].endswith("/"):
+            raise BadgeError(f"fake badge: mpremote {' '.join(args[:2])} is not simulated")
+        dst = Path(args[-1])
+        for src in args[2:-1]:
+            path = src[1:]
+            if path in self.cp_drop:
+                self.cp_drop = self.cp_drop - {path}
+                raise BadgeError(f"fake badge: simulated copy failure at {path}")
+            self._sleep()
+            shutil.copyfile(self._p(path), dst / Path(path).name)
+
+    def backup(self, dest_dir, progress=None, cancel=None):
+        from .badge import BadgeService
+        return BadgeService.backup(self, dest_dir, progress=progress, cancel=cancel)
+
+    def file_sha256(self, path):
+        p = self._p(path)
+        return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+
+    def reset(self, wait=True):
         self._sleep(10)
         self._boot_app_list()
-        self.log("fake badge: hard reset")
+        self.log("fake badge: hard reset" + (" (waited for boot)" if wait else ""))
 
     def esptool(self, *args, timeout=600, line_cb=None):
         for line in ("esptool (simulated) " + " ".join(args), "Connecting....", "Done (simulated)"):

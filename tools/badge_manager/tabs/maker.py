@@ -362,7 +362,8 @@ class MakerTab(BaseTab):
             return
         if self.broadcast_var.get() and not self._local_ok():
             return
-        if not self._confirm_write("\n\nThe app will be installed (if on) and the badge hard-reset."):
+        if not self._confirm_write("\n\nThe app is installed or updated (if on, and only when the badge copy is missing "
+                                   "or differs) and the badge hard-reset."):
             return
 
         def done(res):

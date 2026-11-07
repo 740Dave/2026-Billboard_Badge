@@ -23,6 +23,7 @@ from tkinter import filedialog, ttk
 import customtkinter as ctk
 
 from core import theme
+from core.badge import BACKUP_MANIFEST, backup_is_complete
 from core.theme import COLORS
 
 from .base import BaseTab, Section, confirm, human_size, info
@@ -454,7 +455,8 @@ class DeviceTab(BaseTab):
         b = sec.body
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.pack(fill="x")
-        ctk.CTkButton(row, text="Back up entire badge", command=self.backup_now).pack(side="left", padx=(0, 6))
+        self.backup_btn = ctk.CTkButton(row, text="Back up entire badge", command=self.backup_now)
+        self.backup_btn.pack(side="left", padx=(0, 6))
         ctk.CTkButton(row, text="Restore from backup…", fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
                       command=self.restore_from).pack(side="left")
         ctk.CTkLabel(b, text=WIFI_NOTE, anchor="w", justify="left", wraplength=380,
@@ -463,6 +465,8 @@ class DeviceTab(BaseTab):
         self.backup_msg.pack(fill="x", pady=(6, 0))
         self.restore_bar = ctk.CTkProgressBar(b, height=8)
         self.restore_bar.set(0)
+        self.backup_stop_btn = ctk.CTkButton(b, text="Stop backup", width=110, command=self.cancel_backup)
+        self._backup_cancel = False
         hdr = ctk.CTkFrame(b, fg_color="transparent")
         hdr.pack(fill="x", pady=(6, 2))
         ctk.CTkLabel(hdr, text="Recent backups", anchor="w", font=ctk.CTkFont(weight="bold")).pack(side="left")
@@ -491,8 +495,12 @@ class DeviceTab(BaseTab):
         for p in items:
             r = ctk.CTkFrame(self.backup_list, fg_color="transparent")
             r.pack(fill="x")
-            ctk.CTkLabel(r, text=p.name, anchor="w").pack(side="left")
+            complete = backup_is_complete(p)
+            ctk.CTkLabel(r, text=p.name if complete else f"{p.name}  (incomplete)", anchor="w",
+                         text_color=COLORS["text"] if complete else COLORS["warning_text"]).pack(side="left")
+            # Only verified backups can be restored from the list (grey = disabled).
             ctk.CTkButton(r, text="Restore", width=60, height=22, fg_color=COLORS["danger"], hover_color=COLORS["danger_hover"],
+                          state="normal" if complete else "disabled",
                           command=lambda p=p: self.restore_from(str(p))).pack(side="right", padx=2)
             ctk.CTkButton(r, text="Show", width=50, height=22,
                           command=lambda p=p: self.open_in_finder(p)).pack(side="right", padx=2)
@@ -508,20 +516,51 @@ class DeviceTab(BaseTab):
 
     def backup_now(self) -> None:
         dest = self.backup_dir
-        self.backup_msg.configure(text="Backing up… (a full copy can take a minute or two)")
+        self.backup_msg.configure(text="Backing up… listing badge files (a full copy takes several minutes "
+                                       "on a badge with a full gallery)")
+        self.backup_btn.configure(state="disabled")
+        self._backup_cancel = False
+        self.restore_bar.set(0)
+        self.restore_bar.pack(fill="x", pady=(4, 0), after=self.backup_msg)
+        self.backup_stop_btn.configure(state="normal")
+        self.backup_stop_btn.pack(anchor="w", pady=(4, 0), after=self.restore_bar)
+
+        def progress(done, total, text):
+            self.ctx.ui(self._backup_progress, done, total, text)
+
+        def finish():
+            self.backup_btn.configure(state="normal")
+            self.restore_bar.pack_forget()
+            self.backup_stop_btn.pack_forget()
+            self._load_backups()
 
         def done(path):
+            finish()
             self.last_backup = Path(path)
-            self.backup_msg.configure(text=f"Backed up to:\n{path}\n{WIFI_NOTE}")
+            self.backup_msg.configure(text=f"Backed up and verified:\n{path}\n{WIFI_NOTE}")
             self.ctx.log(f"Backup saved to {path}")
             self.ctx.status("Backup complete")
-            self._load_backups()
             self._remind_reset("Backup finished.")
 
         def fail(e):
+            finish()
             self.backup_msg.configure(text=f"Backup failed: {e}")
             self._remind_reset("Backup failed.")
-        self.ctx.run_device_task(lambda: self.ctx.badge.backup(dest), done, fail, title="Backing up badge")
+        self.ctx.run_device_task(lambda: self.ctx.badge.backup(dest, progress=progress,
+                                                               cancel=lambda: self._backup_cancel),
+                                 done, fail, title="Backing up badge")
+
+    def _backup_progress(self, done: int, total: int, text: str) -> None:
+        self.restore_bar.set(done / total if total else 0)
+        pct = f"{done * 100 // total}% · " if total else ""
+        line = f"Backing up… {pct}{human_size(done)} of {human_size(total)} · {text}" if total else f"Backing up… {text}"
+        self.backup_msg.configure(text=line)
+        self.ctx.status(line)
+
+    def cancel_backup(self) -> None:
+        self._backup_cancel = True
+        self.backup_stop_btn.configure(state="disabled")
+        self.backup_msg.configure(text="Stopping the backup after the current batch…")
 
     def restore_from(self, folder: str | None = None, ask: bool = True) -> None:
         """Restore everything from a backup, including /data (existing /data files are overwritten
@@ -534,6 +573,17 @@ class DeviceTab(BaseTab):
         if not folder.is_dir() or not any(folder.iterdir()):
             info(self, "Empty folder", f"{folder} is empty or missing.")
             return
+        if not backup_is_complete(folder):
+            partial = (folder / BACKUP_MANIFEST).exists()
+            if not ask and partial:
+                info(self, "Incomplete backup", f"{folder.name} is an incomplete backup; it can't be restored.")
+                return
+            if ask and not confirm(self, "Incomplete or unverified backup",
+                                   f"{folder.name} has no COMPLETE marker: "
+                                   + ("the backup did not finish, so files are missing (see its MANIFEST.txt)."
+                                      if partial else "it wasn't made (or verified) by this version of the app.")
+                                   + "\n\nRestoring it may put back only part of the badge. Continue anyway?"):
+                return
         if not (folder / "main.py").exists() and not (folder / "apps").exists() and ask:
             if not confirm(self, "Not a badge backup?", f"{folder} has no main.py or apps/ folder.\n"
                            "Copy its contents onto the badge root anyway?"):

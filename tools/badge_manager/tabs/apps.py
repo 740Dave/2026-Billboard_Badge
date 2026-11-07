@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import datetime
+import gc
 import hashlib
 import json
 import re
@@ -82,10 +83,12 @@ def concrete_classes(src: str, classes: list[str]) -> list[str]:
     return out
 
 
-def app_names(src: str, classes: list[str]) -> list[tuple[str, str, bool]]:
-    """Best guess of each class's runtime BaseApp .name (what last_app.json stores as "app"):
-    [(class, name, sure)]. Uses a literal `self.name = "..."` or `super().__init__("...")` in the class
-    body, else the class name (BaseApp's default). sure=False when the body computes the name."""
+_UNK = object()   # "can't tell statically"
+
+
+def _regex_names(src: str, classes: list[str]) -> list[tuple[str, str, bool]]:
+    """Fallback when the source doesn't parse: literal self.name / super().__init__("...") in the
+    class body, else the class name. sure=False when the body computes the name."""
     out = []
     for c in classes:
         m = re.search(rf"^class\s+{c}\b.*?(?=^\S|\Z)", src, re.M | re.S)
@@ -100,6 +103,192 @@ def app_names(src: str, classes: list[str]) -> list[tuple[str, str, bool]]:
             out.append((c, sup[-1][1], True))
         else:
             out.append((c, c, not computed))
+    return out
+
+
+class _NameSim:
+    """Statically run a BaseApp subclass's __init__ chain (classes of the same file only) to find the
+    .name an instance gets, e.g. ScheduleApp: self.name = self.day + " Talks" with SatSchedule.day =
+    "Sat" -> "Sat Talks". Understands string literals, + concatenation, `x or y`, f-strings, parameter
+    defaults, class/instance attributes, super().__init__(...) / Base.__init__(self, ...) and
+    BaseApp's own rule (name or class name). Anything else -> _UNK."""
+
+    def __init__(self, tree: ast.Module):
+        self.defs = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+
+    @staticmethod
+    def _bases(cd: ast.ClassDef) -> list[str]:
+        return [b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else "?"
+                for b in cd.bases]
+
+    def mro(self, cls: str) -> list | None:
+        """Local classes, most derived first, ending with "BaseApp" (None if a base is unknown)."""
+        out, cur = [], cls
+        while True:
+            if cur == "BaseApp" and cur not in self.defs:
+                return out + ["BaseApp"]
+            cd = self.defs.get(cur)
+            if cd is None:
+                return None
+            out.append(cd)
+            bases = self._bases(cd)
+            if len(bases) != 1:   # multiple inheritance / no base: don't guess
+                return None
+            cur = bases[0]
+
+    def name(self, cls: str):
+        mro = self.mro(cls)
+        if not mro:
+            return _UNK
+        self._mro, self._inst = mro, {}
+        try:
+            return self._call(0, [], {})
+        except RecursionError:
+            return _UNK
+
+    def _attr(self, attr: str):
+        if attr in self._inst:
+            return self._inst[attr]
+        for cd in self._mro[:-1]:
+            for st in cd.body:
+                if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == attr for t in st.targets):
+                    return self._eval(st.value, {})
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == attr \
+                        and st.value is not None:
+                    return self._eval(st.value, {})
+        return _UNK
+
+    def _eval(self, e, env: dict):
+        if isinstance(e, ast.Constant) and (isinstance(e.value, str) or e.value is None):
+            return e.value
+        if isinstance(e, ast.Name):
+            return env.get(e.id, _UNK)
+        if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name) and e.value.id == "self":
+            return self._attr(e.attr)
+        if isinstance(e, ast.Attribute) and e.attr == "__name__" and isinstance(e.value, ast.Attribute) \
+                and e.value.attr == "__class__" and isinstance(e.value.value, ast.Name) and e.value.value.id == "self":
+            return self._mro[0].name
+        if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
+            a, b = self._eval(e.left, env), self._eval(e.right, env)
+            return a + b if isinstance(a, str) and isinstance(b, str) else _UNK
+        if isinstance(e, ast.BoolOp) and isinstance(e.op, ast.Or):
+            for v in e.values:
+                r = self._eval(v, env)
+                if r is _UNK:
+                    return _UNK
+                if r:
+                    return r
+            return r
+        if isinstance(e, ast.JoinedStr):
+            parts = []
+            for v in e.values:
+                r = self._eval(v.value if isinstance(v, ast.FormattedValue) else v, env)
+                if not isinstance(r, str) or (isinstance(v, ast.FormattedValue) and (v.conversion != -1 or v.format_spec)):
+                    return _UNK
+                parts.append(r)
+            return "".join(parts)
+        return _UNK
+
+    def _init_target(self, call, idx: int):
+        """Index in the MRO whose __init__ this call runs, else None. Handles super().__init__(...)
+        and Base.__init__(self, ...)."""
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and f.attr == "__init__"):
+            return None
+        if isinstance(f.value, ast.Call) and isinstance(f.value.func, ast.Name) and f.value.func.id == "super":
+            return idx + 1, call.args
+        if isinstance(f.value, ast.Name) and call.args and isinstance(call.args[0], ast.Name) \
+                and call.args[0].id == "self":
+            for j in range(idx + 1, len(self._mro)):
+                n = self._mro[j] if isinstance(self._mro[j], str) else self._mro[j].name
+                if n == f.value.id:
+                    return j, call.args[1:]
+        return None
+
+    def _call(self, idx: int, args: list, kwargs: dict):
+        """Run the __init__ that self._mro[idx:] provides with these argument values; return the
+        resulting self.name (or _UNK)."""
+        for j in range(idx, len(self._mro)):
+            if self._mro[j] == "BaseApp":    # BaseApp.__init__(self, name=None): name or class name
+                v = args[0] if args else kwargs.get("name")
+                return v if isinstance(v, str) and v else self._mro[0].name if v in (None, "") else _UNK
+            init = next((s for s in self._mro[j].body if isinstance(s, ast.FunctionDef) and s.name == "__init__"), None)
+            if init is not None:
+                break
+        else:
+            return _UNK
+        a = init.args
+        if a.vararg or a.kwarg or a.posonlyargs or a.kwonlyargs:
+            return _UNK
+        params = [p.arg for p in a.args[1:]]
+        defaults = dict(zip(params[len(params) - len(a.defaults):], a.defaults))
+        env = {}
+        for i, p in enumerate(params):
+            if i < len(args):
+                env[p] = args[i]
+            elif p in kwargs:
+                env[p] = kwargs[p]
+            elif p in defaults:
+                env[p] = self._eval(defaults[p], {})
+            else:
+                return _UNK
+        name = _UNK
+        for st in init.body:
+            call = st.value if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) else None
+            tgt = self._init_target(call, j) if call is not None else None
+            if tgt is not None:
+                k, cargs = tgt
+                vals = [self._eval(x, env) for x in cargs]
+                kw = {x.arg: self._eval(x.value, env) for x in call.keywords if x.arg}
+                if len(kw) != len(call.keywords):
+                    return _UNK
+                name = self._call(k, vals, kw)
+                if name is _UNK:
+                    return _UNK
+                continue
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Attribute) \
+                    and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == "self":
+                v = self._eval(st.value, env)
+                self._inst[st.targets[0].attr] = v
+                if st.targets[0].attr == "name":
+                    name = v
+                continue
+            # anything else that might set the name (if/for/try blocks, setattr, helper calls with self)
+            for n in ast.walk(st):
+                if isinstance(n, ast.Attribute) and n.attr in ("name", "__init__") and isinstance(n.ctx, ast.Store):
+                    return _UNK
+                if isinstance(n, ast.Attribute) and n.attr == "__init__":
+                    return _UNK
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "setattr":
+                    return _UNK
+        return name if isinstance(name, str) else _UNK
+
+
+def app_names(src: str, classes: list[str]) -> list[tuple[str, str, bool]]:
+    """Best guess of each class's runtime BaseApp .name (what /data/app_list and last_app.json store):
+    [(class, name, sure)]. The __init__ chain is followed through base classes of the same file (so a
+    base that computes self.name from a subclass attribute gives e.g. "Sat Talks"). sure=False when
+    the name can't be worked out exactly; the guess is then the class name or a literal from its body
+    (menu_positions() replaces it with the badge's real name when one matches)."""
+    # Runs on the device worker: keep the garbage collector off while parsing, so a collection
+    # doesn't run Tk objects' __del__ on this thread (that blocks on the Tk main thread).
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        sim = _NameSim(ast.parse(src))
+    except (SyntaxError, ValueError):
+        return _regex_names(src, classes)
+    finally:
+        if was_on:
+            gc.enable()
+    fallback = dict((c, (n, s)) for c, n, s in _regex_names(src, classes))
+    out = []
+    for c in classes:
+        n = sim.name(c) if c in sim.defs else _UNK
+        if isinstance(n, str) and n:
+            out.append((c, n, True))
+        else:
+            out.append((c, fallback[c][0], False))
     return out
 
 
@@ -352,6 +541,12 @@ def menu_positions(apps: list[BadgeApp], app_list: list[str] | None = None) -> i
                     found[(a.path, i)] = k + 1
                     del free[k]
                     break
+    # Uncertain guesses that matched a slot: use the badge's real name (still marked unsure, so
+    # "Set as boot app" keeps its warning, but it offers the name the badge actually uses).
+    for a, i, (cls, name, sure) in wanted:
+        k = found.get((a.path, i))
+        if k is not None and not sure and i < len(a.names) and app_list[k - 1] != name:
+            a.names[i] = (cls, app_list[k - 1], False)
     for a in menu:
         slots = sorted(found[(a.path, i)] for i in range(len(a.classes)) if (a.path, i) in found)
         missing = len(a.classes) - len(slots)

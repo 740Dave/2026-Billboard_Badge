@@ -54,6 +54,49 @@ class FileEntry:
     is_dir: bool
 
 
+# ------------------------------------------------------------------ backups
+BACKUP_MANIFEST = "MANIFEST.txt"   # written into every backup folder (never copied to the badge)
+BACKUP_COMPLETE = "COMPLETE"       # only when every file's size matched the badge listing
+BACKUP_RATE = 2000                 # bytes/s worst case for mpremote fs cp (~3 KB/s on a real badge)
+BACKUP_BATCH_BYTES = 160 * 1024    # per mpremote session (~1 min on a real badge)
+BACKUP_BATCH_FILES = 40
+
+
+class BackupIncomplete(BadgeError):
+    def __init__(self, msg: str, path: Path):
+        super().__init__(msg)
+        self.path = path
+
+
+def backup_is_complete(folder: str | Path) -> bool:
+    return (Path(folder) / BACKUP_COMPLETE).is_file()
+
+
+def backup_timeout(nbytes: int) -> float:
+    return 30 + nbytes / BACKUP_RATE
+
+
+def backup_batches(files: list, max_bytes: int = BACKUP_BATCH_BYTES, max_files: int = BACKUP_BATCH_FILES) -> list:
+    """Group FileEntry items by badge folder (mpremote cp copies many sources into ONE local folder),
+    then split each group so a batch stays under max_bytes / max_files (a lone big file is its own batch)."""
+    import posixpath
+    groups: dict[str, list] = {}
+    for e in files:
+        groups.setdefault(posixpath.dirname(e.path), []).append(e)
+    out = []
+    for items in groups.values():
+        cur, size = [], 0
+        for e in items:
+            if cur and (size + e.size > max_bytes or len(cur) >= max_files):
+                out.append(cur)
+                cur, size = [], 0
+            cur.append(e)
+            size += e.size
+        if cur:
+            out.append(cur)
+    return out
+
+
 def _mpremote_cmd() -> list[str]:
     """Run mpremote with the same interpreter as the app, so the venv's copy is used."""
     return [sys.executable, "-m", "mpremote"]
@@ -93,18 +136,32 @@ class BadgeService:
         if not self.port:
             raise BadgeError("No serial port selected")
         cmd = _mpremote_cmd() + ["connect", self.port, "resume", *args]
-        if args and args[0] != "reset":
-            self._set_interrupted(True)
+        pauses = bool(args) and args[0] != "reset"
         with self.lock:
             self.log(f"$ mpremote {' '.join(args)[:120]}")
             try:
                 cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             except subprocess.TimeoutExpired as e:
+                if pauses:   # it was connected and working when it ran out of time
+                    self._set_interrupted(True)
                 raise BadgeError(f"mpremote timed out after {timeout}s: {' '.join(args)[:80]}") from e
+        # The badge UI is only paused once mpremote actually got in; a failed connect (port gone
+        # during a reboot, port busy) leaves it running.
+        if pauses and (cp.returncode == 0 or not self._connect_failed(cp)):
+            self._set_interrupted(True)
         if check and cp.returncode != 0:
             msg = (cp.stderr or cp.stdout).strip().splitlines()[-1:] or ["unknown error"]
             raise BadgeError(f"mpremote {args[0]} failed: {msg[0]}")
         return cp
+
+    # mpremote messages that mean it never reached the badge's REPL
+    CONNECT_ERRORS = ("failed to access", "device not configured", "could not open port",
+                      "no device found", "resource busy")
+
+    @classmethod
+    def _connect_failed(cls, cp: subprocess.CompletedProcess) -> bool:
+        text = ((cp.stderr or "") + (cp.stdout or "")).lower()
+        return any(m in text for m in cls.CONNECT_ERRORS)
 
     def _set_interrupted(self, value: bool) -> None:
         if value != self.ui_interrupted:
@@ -206,6 +263,22 @@ class BadgeService:
             print(json.dumps(out))
         """, timeout=180)
 
+    def file_sha256(self, path: str) -> str | None:
+        """sha256 hex of one badge file (None if it doesn't exist). Cheaper than file_hashes()."""
+        return self.exec_json(f"""
+            import json, hashlib, binascii
+            try:
+                h = hashlib.sha256()
+                with open({path!r}, 'rb') as f:
+                    while True:
+                        b = f.read(2048)
+                        if not b: break
+                        h.update(b)
+                print(json.dumps(binascii.hexlify(h.digest()).decode()))
+            except OSError:
+                print(json.dumps(None))
+        """)
+
     def read_file(self, remote: str) -> bytes:
         with tempfile.TemporaryDirectory() as td:
             local = Path(td) / "f"
@@ -269,6 +342,8 @@ class BadgeService:
         for f in sorted(local_root.rglob("*")):
             if "__pycache__" in f.parts or f.name.startswith("."):
                 continue
+            if f.parent == local_root and f.name in (BACKUP_MANIFEST, BACKUP_COMPLETE):
+                continue   # backup bookkeeping, not badge files
             rp = base + "/" + f.relative_to(local_root).as_posix()
             if f.is_dir():
                 local[rp] = ""
@@ -336,27 +411,153 @@ class BadgeService:
             progress(len(plan["copy"]), len(plan["copy"]), "done")
         return {"copied": copied, "deleted": deleted, "kept": plan["kept"], "unchanged": plan["unchanged"]}
 
-    def backup(self, dest_dir: str | Path) -> Path:
-        """Copy the badge's whole filesystem into dest_dir/<timestamp>/ and return that path."""
+    def walk(self, root: str = "/") -> list[FileEntry]:
+        """Strict recursive listing for backups: unlike listdir() a read error raises instead of
+        silently giving a partial list."""
+        data = self.exec_json(f"""
+            import os, json
+            out = []
+            def walk(p):
+                for name, typ, *_ in os.ilistdir(p):
+                    full = p.rstrip('/') + '/' + name
+                    if typ == 0x4000:
+                        out.append([full, 0, True])
+                        walk(full)
+                    else:
+                        out.append([full, os.stat(full)[6], False])
+            walk({root!r})
+            print(json.dumps(out))
+        """, timeout=120)
+        return [FileEntry(p, s, d) for p, s, d in data]
+
+    def backup(self, dest_dir: str | Path, progress=None, cancel=None) -> Path:
+        """Copy the badge's whole filesystem into dest_dir/badge-<timestamp>/ and return that path.
+
+        File by file: list every file with its size (walk), then copy them in batches, one mpremote
+        session per batch (all files of a batch share one badge folder), each with a timeout scaled to
+        its size. Every file's size is checked against the listing and missing/short files are retried
+        once. MANIFEST.txt is always written; the COMPLETE marker only when every file verified.
+        progress(done_bytes, total_bytes, text) is called after each step; cancel() -> True stops
+        between batches. Raises BackupIncomplete (with .path) when anything is missing."""
         import datetime
-        dest = Path(dest_dir) / datetime.datetime.now().strftime("badge-%Y%m%d-%H%M%S")
+        import posixpath
+        import time
+        t0 = time.time()
+        started = datetime.datetime.now()
+        dest = Path(dest_dir) / started.strftime("badge-%Y%m%d-%H%M%S")
         dest.mkdir(parents=True, exist_ok=True)
-        self._run("fs", "cp", "-r", ":/", str(dest) + "/", timeout=600)
-        # mpremote may nest the copy one level down; normalise and verify it's a whole badge.
-        if not (dest / "main.py").exists():
-            nested = [d for d in dest.iterdir() if d.is_dir() and (d / "main.py").exists()]
-            if len(nested) == 1:
-                for item in nested[0].iterdir():
-                    item.rename(dest / item.name)
-                nested[0].rmdir()
-        if not (dest / "main.py").exists():
-            raise BadgeError(f"Backup in {dest} looks incomplete (no main.py)")
+        say = progress or (lambda done, total, text: None)
+        stop = cancel or (lambda: False)
+        say(0, 0, "listing badge files")
+        entries = self.walk("/")
+        files = [e for e in entries if not e.is_dir]
+        total = sum(e.size for e in files)
+        self.log(f"backup: {len(files)} files, {total} bytes -> {dest}")
+        for e in entries:
+            if e.is_dir:
+                (dest / e.path.lstrip("/")).mkdir(parents=True, exist_ok=True)
+
+        def local(e: FileEntry) -> Path:
+            return dest / e.path.lstrip("/")
+
+        def verified(e: FileEntry) -> bool:
+            p = local(e)
+            return p.is_file() and p.stat().st_size == e.size
+
+        def copy(batch: list[FileEntry]) -> None:
+            folder = local(batch[0]).parent
+            folder.mkdir(parents=True, exist_ok=True)
+            try:
+                self._run("fs", "cp", *[":" + e.path for e in batch], str(folder) + "/",
+                          timeout=backup_timeout(sum(e.size for e in batch)))
+            except BadgeError as ex:   # verified()/retry below decide what's missing
+                self.log(f"backup: copy in {posixpath.dirname(batch[0].path)} failed: {ex}")
+
+        done = 0
+        for batch in backup_batches(files):
+            if stop():
+                break
+            copy(batch)
+            done += sum(e.size for e in batch)
+            say(done, total, f"{posixpath.dirname(batch[0].path)} ({len(batch)} file(s))")
+        bad = [e for e in files if not verified(e)]
+        if bad and not stop():
+            self.log(f"backup: retrying {len(bad)} missing or short file(s) one by one")
+            for i, e in enumerate(bad):
+                if stop():
+                    break
+                say(done, total, f"retry {i + 1}/{len(bad)}: {e.path}")
+                copy([e])
+            bad = [e for e in files if not verified(e)]
+        cancelled = stop()
+        secs = time.time() - t0
+        bad_set = {e.path for e in bad}
+        lines = ["# Badge Manager backup (one line per badge entry: size<TAB>status<TAB>path)",
+                 f"# created {started:%Y-%m-%d %H:%M:%S}, took {secs:.0f} s",
+                 f"# files {len(files)}, bytes {total}",
+                 "# status " + ("COMPLETE" if not bad and not cancelled else
+                                f"INCOMPLETE: {len(bad)} file(s) missing or short"
+                                + (" (cancelled)" if cancelled else ""))]
+        for e in entries:
+            if e.is_dir:
+                lines.append(f"-\tdir\t{e.path}")
+            else:
+                have = local(e).stat().st_size if local(e).is_file() else None
+                st = "ok" if e.path not in bad_set else ("missing" if have is None else f"short:{have}")
+                lines.append(f"{e.size}\t{st}\t{e.path}")
+        (dest / BACKUP_MANIFEST).write_text("\n".join(lines) + "\n")
+        if bad or cancelled:
+            first = ", ".join(e.path for e in bad[:3]) + (" ..." if len(bad) > 3 else "")
+            why = "cancelled" if cancelled else "copy errors"
+            raise BackupIncomplete(f"Backup INCOMPLETE ({why}): {len(bad)} of {len(files)} file(s) missing or "
+                                   f"short{': ' + first if first else ''}. What was copied is in {dest} "
+                                   "(marked incomplete; it can't be restored from the list).", dest)
+        (dest / BACKUP_COMPLETE).write_text(f"{len(files)} files, {total} bytes verified; "
+                                            f"{started:%Y-%m-%d %H:%M:%S}, {secs:.0f} s\n")
+        self.log(f"backup complete: {len(files)} files, {total} bytes verified in {secs:.0f} s")
         return dest
 
-    def reset(self) -> None:
-        """Hard reset (never soft reset: LVGL breaks)."""
-        self._run("reset", check=False, timeout=15)
-        self._set_interrupted(False)
+    # After machine.reset() the ESP32-S3's USB port disappears (~1.4 s on a real badge) and comes
+    # back (~1.7 s); main.py reaches its main loop ~6 s after the reset and the first app then draws
+    # the e-paper panel. Commands sent earlier fail ("Device not configured") or interrupt the boot,
+    # so reset() waits for it.
+    RESET_GONE_S = 4.0       # wait this long for the port to vanish
+    RESET_BACK_S = 25.0      # ...and this long for it to come back
+    BOOT_SETTLE_S = 15.0     # then let main.py boot and draw before anything else talks to the badge
+
+    def _port_present(self) -> bool:
+        import os
+        if not self.port:
+            return False
+        if self.port.startswith("/"):   # macOS / Linux device node
+            return os.path.exists(self.port)
+        return any(p.device == self.port for p in self.list_ports())
+
+    def wait_for_boot(self) -> bool:
+        """Block until the badge is back after a hard reset. False if the port didn't return."""
+        import time
+        t0 = time.time()
+        while self._port_present() and time.time() - t0 < self.RESET_GONE_S:
+            time.sleep(0.1)
+        while not self._port_present() and time.time() - t0 < self.RESET_GONE_S + self.RESET_BACK_S:
+            time.sleep(0.2)
+        if not self._port_present():
+            self.log(f"badge: {self.port} did not come back {time.time() - t0:.0f} s after the reset")
+            return False
+        back = time.time() - t0
+        time.sleep(self.BOOT_SETTLE_S)
+        self.log(f"badge: port back {back:.1f} s after reset; waited {time.time() - t0:.0f} s for boot")
+        return True
+
+    def reset(self, wait: bool = True) -> None:
+        """Hard reset (never soft reset: LVGL breaks). wait=True (default): return only once the
+        badge has rebooted (port back + boot time), so follow-up reads don't race the reboot."""
+        with self.lock:
+            self._run("reset", check=False, timeout=15)
+            self._set_interrupted(False)
+            if wait:
+                self.wait_for_boot()
+
 
     # ------------------------------------------------------- runtime flashing
     def esptool(self, *args: str, timeout: float = 600, line_cb=None) -> int:

@@ -29,6 +29,7 @@ Pure helpers below take a badge service (BadgeService or FakeBadgeService) as ar
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -225,9 +226,11 @@ def build_settings(existing: dict, name: str, makes: str, broadcast: bool, badge
     err = validate_broadcast(name) or validate_makes(makes)
     if err:
         raise ValueError(err)
-    out = {k: v for k, v in existing.items() if k not in ("id", "name", "makes", "broadcast")}
+    out = dict(existing)    # read-modify-write: existing keys keep their order, new ones are appended
     if badge_id:
         out["id"] = badge_id
+    else:
+        out.pop("id", None)
     out["name"] = name
     out["makes"] = makes
     out["broadcast"] = bool(broadcast)
@@ -320,6 +323,31 @@ def install_app(badge, local: Path, log=print) -> dict:
     return {"removed_old": removed_old, "migrated": migrated}
 
 
+def local_sha256(local: Path | None) -> str | None:
+    try:
+        return hashlib.sha256(Path(local).read_bytes()).hexdigest() if local else None
+    except OSError:
+        return None
+
+
+def remote_app_sha256(badge) -> str | None:
+    """sha256 of /apps/maker_detector.py on the badge (None = not there)."""
+    return badge.file_sha256(BADGE_APP_PATH)
+
+
+def install_reason(badge, local: Path | None) -> str | None:
+    """Why the app has to be (re)installed: "missing", "differs", or None (identical / no local file)."""
+    if local is None:
+        return None
+    try:
+        remote = remote_app_sha256(badge)
+    except Exception:  # noqa: BLE001  (can't tell: install, as before)
+        return "differs"
+    if remote is None:
+        return "missing"
+    return None if remote == local_sha256(local) else "differs"
+
+
 def app_installed(badge) -> bool:
     try:
         return bool(badge.exists(BADGE_APP_PATH))
@@ -335,10 +363,16 @@ def apply_job(badge, profile: dict, local: Path | None, log=print) -> dict:
     handle, makes = profile_handle(profile), profile.get("makes") or ""
     try:
         if profile.get("detector_enabled"):
-            if local is not None:
+            reason = install_reason(badge, local)
+            if reason:
                 res.update(install_app(badge, local, log=log))
                 res["action"] = "installed"
-            elif app_installed(badge):
+            elif local is not None or app_installed(badge):
+                if local is not None:
+                    log(f"{BADGE_APP_PATH} on the badge is identical to {local}; not reinstalled")
+                if badge.exists(OLD_APP_PATH):   # two detectors would both advertise
+                    badge.remove(OLD_APP_PATH)
+                    res["removed_old"] = True
                 res["action"] = "settings"
             else:
                 raise FileNotFoundError("Maker Detector app file not found locally: "
@@ -361,8 +395,9 @@ def apply_job(badge, profile: dict, local: Path | None, log=print) -> dict:
     return res
 
 
-def probe_job(badge) -> dict:
-    """Blocking: what's on this badge? {"uid","installed","old_installed","broadcast","owner"}."""
+def probe_job(badge, local: Path | None = None) -> dict:
+    """Blocking: what's on this badge? {"uid","installed","old_installed","broadcast","owner",
+    "app_match"}; app_match: badge's maker_detector.py identical to `local` (None = no local file)."""
     uid = badge_uid(badge)
     s = read_settings(badge)
     o = read_owner(badge)
@@ -372,8 +407,79 @@ def probe_job(badge) -> dict:
     # settings file does (older detectors read only maker.json / nerd.json).
     bc = bool(o.get("broadcast")) or bool(installed and s and s.get("broadcast", True)) or \
         bool(old_installed and old.get("broadcast", False))
+    match = None
+    if installed and local is not None:
+        try:
+            match = remote_app_sha256(badge) == local_sha256(local)
+        except Exception:  # noqa: BLE001
+            match = None
     return {"uid": uid, "installed": installed, "old_installed": old_installed,
-            "broadcast": bc, "owner": o}
+            "broadcast": bc, "owner": o, "app_match": match}
+
+
+def owner_matches(owner: dict, profile: dict, broadcast: bool) -> bool:
+    """owner.json already says what the profile would write (maker_handle, makes, broadcast)?"""
+    return (str(owner.get("maker_handle") or "") == profile_handle(profile)
+            and (owner.get("makes") or "") == clean_makes(profile.get("makes") or "")[:MAX_MAKES]
+            and bool(owner.get("broadcast")) == bool(broadcast))
+
+
+def plan_job(badge, profile: dict, local: Path | None) -> dict:
+    """Blocking, read-only: exactly what apply_job would write, for the confirmation dialog.
+    {"owner": new owner.json dict, "owner_same": bool, "maker": new maker.json dict | None,
+     "maker_same": bool, "install": "missing" | "differs" | None, "local": str | None,
+     "remove_old": bool, "error": str | None}"""
+    handle = profile_handle(profile)
+    makes = clean_makes(profile.get("makes") or "")[:MAX_MAKES]
+    on = bool(profile.get("detector_enabled"))
+    owner_now = read_owner(badge)
+    owner_new = json.loads(build_owner(owner_now, handle, makes, on))
+    sync_maker = on or app_installed(badge) or badge.exists(SETTINGS_PATH)
+    maker_now = read_settings(badge) if sync_maker else {}
+    maker_new = json.loads(build_settings(maker_now, broadcast_text(handle), makes, on, existing_id(badge, maker_now),
+                                          display_name=handle)) if sync_maker else None
+    install = install_reason(badge, local) if on else None
+    error = None
+    if on and local is None and not app_installed(badge):
+        error = "Maker Detector app file not found locally: " + ", ".join(str(p) for p in local_app_candidates())
+    return {"owner": owner_new, "owner_same": owner_new == owner_now, "maker": maker_new,
+            "maker_same": maker_new == maker_now, "install": install, "local": str(local) if local else None,
+            "remove_old": on and badge.exists(OLD_APP_PATH),
+            "old_off": (not on) and badge.exists(OLD_APP_PATH) and bool(_read_json(badge, OLD_SETTINGS_PATH).get("broadcast")),
+            "error": error}
+
+
+def describe_plan(plan: dict) -> str:
+    """Confirmation text listing every write apply_job will do."""
+    o = plan["owner"]
+    lines = [f"{OWNER_PATH}" + (" (unchanged content, rewritten):" if plan["owner_same"] else ":"),
+             f"    maker_handle: {o.get('maker_handle')!r}", f"    makes: {o.get('makes')!r}",
+             f"    broadcast: {'on' if o.get('broadcast') else 'off'}"]
+    others = [k for k in o if k not in ("maker_handle", "makes", "broadcast")]
+    if others:
+        lines.append(f"    other keys kept: {', '.join(others)}")
+    m = plan["maker"]
+    if m is None:
+        lines.append(f"{SETTINGS_PATH}: not touched (no Maker Detector on the badge)")
+    else:
+        lines.append(f"{SETTINGS_PATH}" + (" (unchanged content, rewritten):" if plan["maker_same"] else " (kept in sync):")
+                     + f" name {m.get('name')!r}, broadcast {'on' if m.get('broadcast') else 'off'}, "
+                     + f"id {m.get('id') or '(badge creates one)'}")
+    if plan["install"] == "missing":
+        lines.append(f"{BADGE_APP_PATH}: INSTALL (not on the badge yet) from {plan['local']}")
+    elif plan["install"] == "differs":
+        lines.append(f"{BADGE_APP_PATH}: UPDATE (differs from {plan['local']})")
+    elif plan["owner"].get("broadcast"):
+        lines.append(f"{BADGE_APP_PATH}: no install (badge copy is identical)" if plan["local"]
+                     else f"{BADGE_APP_PATH}: no install (no local copy; badge copy kept)")
+    else:
+        lines.append(f"{BADGE_APP_PATH}: no install (broadcasting is off)")
+    if plan.get("remove_old"):
+        lines.append(f"{OLD_APP_PATH}: removed (old Nerd Detector)")
+    if plan.get("old_off"):
+        lines.append(f"{OLD_SETTINGS_PATH}: broadcast switched off (old Nerd Detector)")
+    lines.append("\nThe badge will restart (hard reset) afterwards.")
+    return "\n".join(lines)
 
 
 # ====================================================================== ctx-level API
@@ -425,7 +531,8 @@ class _Applier:
         if self.pending or not p.get("onboarded") or not self.ctx.badge.port:
             return
         self.pending = True
-        self.ctx.run_device_task(lambda: probe_job(self.ctx.badge), self._probed,
+        local = find_local_app(self.ctx.config.get("repo_dir")) if p.get("detector_enabled") else None
+        self.ctx.run_device_task(lambda: probe_job(self.ctx.badge, local), self._probed,
                                  lambda _e: setattr(self, "pending", False), title="Checking badge profile")
 
     def _probed(self, st: dict) -> None:
@@ -442,6 +549,11 @@ class _Applier:
         port = self.ctx.badge.port
         handle = profile_handle(p)
         owner = st.get("owner") or {}
+        if p.get("detector_enabled") and st.get("installed") and st.get("app_match") is True \
+                and not st.get("old_installed") and owner_matches(owner, p, True):
+            self.ctx.log("Maker Detector: this badge already has the same app and profile; nothing to do")
+            mark_applied(self.ctx.config, uid)
+            return
         if p.get("detector_enabled"):
             text = broadcast_text(handle)
             q = (f"Install Maker Detector and broadcast '{text}' on the badge at {port}?"

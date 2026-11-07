@@ -16,6 +16,7 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+from core.badge import BadgeError
 from core.theme import COLORS
 
 from .base import BaseTab, Section, confirm, info, human_size
@@ -163,7 +164,8 @@ def confirm_text(name: str, sha: str, plan: dict, delete: bool, backup: bool) ->
     if plan.get("lib_kept"):
         msg += f" ({len(plan['lib_kept'])} /lib file(s) not in this version kept, may be used by apps)"
     msg += "\n\n"
-    msg += ("A full file backup is made first.\n" if backup else "No backup (disabled in Settings).\n")
+    msg += ("A full, verified file backup is made first (several minutes with a full gallery); "
+            "the install stops if the backup is incomplete.\n" if backup else "No backup (disabled in Settings).\n")
     msg += "The badge is hard-reset afterwards."
     return msg
 
@@ -700,7 +702,17 @@ class FirmwareTab(BaseTab):
             if backup:
                 self.ctx.ui(lambda: self.progress_label.configure(text="Backing up badge files ..."))
                 bdir = Path(self.ctx.config.get("backup_dir")).expanduser()
-                bpath = badge.backup(bdir)
+
+                def bprog(done, total, text):
+                    line = (f"Backing up badge files: {done * 100 // total}% ({text})" if total
+                            else f"Backing up badge files: {text}")
+                    self.ctx.ui(lambda: self.progress_label.configure(text=line))
+                try:
+                    # Verified, file-by-file backup; raises BackupIncomplete if any file is missing,
+                    # which aborts the install before anything is written.
+                    bpath = badge.backup(bdir, progress=bprog)
+                except Exception as e:  # noqa: BLE001
+                    raise BadgeError(f"Backup before install failed, nothing was installed. {e}") from e
                 self.ctx.log(f"Backup saved to {bpath}")
             plan = install_plan(c["plan"], delete)
             res = badge.push_tree(c["tmpdir"], "/", progress=prog, delete_extra=delete, protect=PROTECT,
@@ -760,6 +772,8 @@ class FirmwareTab(BaseTab):
             rc = self.ctx.badge.esptool(*args, timeout=900, line_cb=self.ctx.log)
             if rc != 0:
                 raise RuntimeError(f"esptool exited with code {rc} (is the badge in bootloader mode?)")
+            if "write-flash" in args and hasattr(self.ctx.badge, "wait_for_boot"):
+                self.ctx.badge.wait_for_boot()   # esptool hard-resets: let it reboot before re-reads
             return rc
 
         def done(_rc):

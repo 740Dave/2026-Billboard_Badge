@@ -404,6 +404,8 @@ class SettingsTab(BaseTab):
                        f"loaded:\n\n{e}\n\nYour settings were saved on this computer.")
             return
 
+        from core import onboarding as ob
+
         def done(_res):
             self.pf_action.configure(text="Sent to the badge.", text_color=COLORS["success_text"])
             self.ctx.events.publish("profile.changed", load_profile(self.ctx.config))  # applied_to changed
@@ -413,8 +415,24 @@ class SettingsTab(BaseTab):
                 e = "select the badge's port in the top bar first"
             self.pf_action.configure(text=f"Sending failed: {e}", text_color=COLORS["danger_text"])
 
-        self.pf_action.configure(text="Sending to the badge...", text_color=COLORS["text"])
-        apply_profile_to_badge(self.ctx, dict(prof), on_done=done, on_error=failed)
+        local = ob.find_local_app(self.ctx.config.get("repo_dir")) if prof.get("detector_enabled") else None
+
+        def planned(plan):
+            # The red button overwrites badge files: show exactly what will be written first.
+            if plan.get("error"):
+                failed(plan["error"])
+                return
+            if not self._confirm("Send profile to badge", "This writes to the badge:\n\n"
+                                 + ob.describe_plan(plan) + "\n\nContinue?"):
+                self.pf_action.configure(text="Not sent; nothing was written. Hard-reset the badge to bring "
+                                              "its UI back (top bar).", text_color=COLORS["warning_text"])
+                return
+            self.pf_action.configure(text="Sending to the badge...", text_color=COLORS["text"])
+            apply_profile_to_badge(self.ctx, dict(prof), on_done=done, on_error=failed)
+
+        self.pf_action.configure(text="Checking what's on the badge...", text_color=COLORS["text"])
+        self.ctx.run_device_task(lambda: ob.plan_job(self.ctx.badge, dict(prof), local), planned, failed,
+                                 title="Checking badge profile")
 
     def _on_profile_event(self, _payload) -> None:
         try:
