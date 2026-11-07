@@ -5,11 +5,18 @@ Every badge with this app installed (and broadcasting turned on) sends a tiny BL
 (The over-the-air format is unchanged from the earlier version of this app, so both see each other.)
 The app listens for those adverts while it's the active app and shows who's around.
 
-Settings: /data/maker.json
-    {"id": "a1b2c3", "name": "Dave", "makes": "robots", "broadcast": true}
-  - id is random, created on first boot (or carried over from the old app's config file).
-  - name is broadcast (max 16 printable ASCII chars).
-  - makes is what you like to make (max 40 chars). Shown on your own screen only, never broadcast.
+Identity (read on boot and each time the app is opened):
+  /data/owner.json  {"maker_handle": "dave", "makes": "robots", "broadcast": true}
+      the owner profile (Badge Manager writes it). Read first.
+  /data/maker.json  {"id": "a1b2c3", "name": "Dave", "makes": "robots", "broadcast": true}
+      legacy file of this app; fallback for each value missing from owner.json, and home of
+      the badge id when lib.presence is not installed.
+  - the handle is broadcast (clipped to 16 printable ASCII chars).
+  - makes (max 64 chars) is shown on your own screen only, never broadcast.
+
+If the firmware has lib/presence.py (BLE presence broadcast), that module owns the badge id and
+the advertising (so we never advertise twice); this app only scans, and B calls
+presence.set_broadcast(). Without it, the app advertises itself in the same format.
 
 Controls while running:
   User A  redraw the screen now
@@ -43,13 +50,24 @@ from lib.button import UserA, UserB
 from lib.epd import display
 from lib.led_bar import leds
 
+try:
+    from lib import presence as _presence     # optional upstream module (PR "ble-presence")
+except Exception:                            # ImportError, or a broken module: never crash
+    _presence = None
+try:
+    from lib.owner import owner as _owner     # optional upstream module (PR "owner-profile")
+except Exception:
+    _owner = None
+
 CONFIG = "/data/maker.json"
+OWNER = "/data/owner.json"
 OLD_CONFIG = "/data/nerd.json"  # migration only: config file of the app's previous name
 MAGIC = b"SC26"
 COMPANY = b"\xff\xff"          # 0xFFFF = "no company / testing" per the Bluetooth SIG
 VERSION = 1
 NAME_MAX = 16
-MAKES_MAX = 40
+HANDLE_MAX = 40                # shown on screen; the broadcast copy is clipped to NAME_MAX
+MAKES_MAX = 64
 ADV_MAX = 31                   # legacy advertising payload limit
 
 ADV_INTERVAL_US = 400_000      # advertise every 400 ms
@@ -72,6 +90,41 @@ _MFR_MIN_LEN = 1 + 2 + 4 + 1 + 3
 
 _BITS = 1024                   # bitmap size for the approximate "devices around" count
 _SEP = "  •  "            # bullet; included in LVGL's built-in Montserrat fonts
+
+# Hackaday "Jolly Wrencher", 92x92, 1 bit per pixel (MONO_HLSB: MSB = leftmost pixel, rows
+# padded to 12 bytes, 1 = black). Drawn with framebuf.blit() straight into display.black
+# after LVGL has rendered, so it needs no extra file, no PNG decoding and no LVGL heap.
+LOGO_W = 92
+LOGO_H = 92
+LOGO_X = 24
+LOGO_Y = 14
+TEXT_X = LOGO_X + LOGO_W + 20  # title and "Broadcasting as" line start right of the logo
+_LOGO_HEX = (
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "007c0000000000000003e000003f800000000000001fc000001fe00000000000007f8000000ff0000000000000ff0000"
+    "0007f8000000000001fe00000003f8000000000001fc00000000fc000000000003f000000000fc000000000007f00000"
+    "0001fe000000000007f800000003fe000000000007fc00008007fe000000000007fe0010c00ffe000000000007ff0030"
+    "e01ffe000000000007ff8070f83ffe000000000007ffc1f0fc7fff00000000000fffe3e07e7fff80000000001fffe7e0"
+    "7fffffe0000000007fffffe03ffffff000000000ffffffc03ffffff800000001ffffffc01ffffffc003fc003ffffff80"
+    "0ffffffe01fff807ffffff0007ffffff0ffffe0ffffffe0001fffffe1fffff87fffff8000000fffc7fffffe3fff00000"
+    "00007ff8fffffff1ffe0000000003ff1fffffff8ffc0000000001ff3fffffffcff800000000007e7fffffffe7e000000"
+    "000003c7fffffffe3c000000000001cfffffffff380000000000009fffffffff900000000000001fffffffff80000000"
+    "0000003fffffffffc00000000000003fffffffffc00000000000003fffffffffc00000000000007fffffffffe0000000"
+    "0000007fffffffffe00000000000007fc1fff83fe00000000000007f807fe01fe0000000000000ff003fc00fe0000000"
+    "000000fe003fc007f0000000000000fc001f8003f0000000000000fc003fc003f0000000000000fc003fc003f0000000"
+    "000000fc007fe003f0000000000000fc01fff803f0000000000000fc0fffff03f00000000000007e1fffff87e0000000"
+    "0000007e1fffff87e00000000000007fbfffffdfe00000000000007ffff9ffffe00000000000003ffff8ffffc0000000"
+    "0000003ffff0ffffc00000000000003ffff0ffffc00000000000011ffff0ffff880000000000079ffff6ffff9e000000"
+    "00000f8ffff6ffff1f00000000001fcfffffffff3f80000000003fe7fffffffe7fc0000000007fe3fffffffc7fe00000"
+    "0000fff1fffffff8fff0000001fffff8fffffff1fffff80007fffffc7fffffe3fffffe000ffffffe3fffffc7ffffff00"
+    "1ffffffc7fffffe3ffffff803ffffff87fbfdfe1ffffffc03fffffe07fbfdfe07fffffc07fffffc03fbf9fc03fffffe0"
+    "7e7fff803f1f8fc01fffe7e0f83fff000c0603000fffc1e0f01ffe000000000007ff80f0e01ffe000000000007ff8070"
+    "c00ffe000000000007ff00308007fe000000000007fe00100003fe000000000007fc00000001fe000000000007f80000"
+    "0000fc000000000007f000000001fc000000000003f800000003f8000000000001fc00000007f8000000000001fe0000"
+    "000ff0000000000000ff0000001fe00000000000007f8000003f800000000000001fc000007c0000000000000003e000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+)
+_logo_fb = None                # framebuf.FrameBuffer, built on first draw; False = unusable
 
 _WHITE = lvgl.color_hex(0xFFFFFF)
 _BLACK = lvgl.color_hex(0x000000)
@@ -149,6 +202,80 @@ def _save_config(cfg):
         print("maker: could not save config:", ex)
 
 
+def _read_owner():
+    """Owner profile as a dict (only keys that are actually set). Uses lib.owner when the
+    firmware has it, else reads /data/owner.json directly. Never raises."""
+    if _owner is not None:
+        try:
+            try:
+                _owner.reload()
+            except Exception:
+                pass
+            d = {}
+            for k in ("maker_handle", "makes", "broadcast"):
+                v = _owner.get(k, None)
+                if v is not None:
+                    d[k] = v
+            return d
+        except Exception as ex:
+            print("maker: lib.owner failed, reading file:", ex)
+    return _read_json(OWNER)
+
+
+def _identity(cfg):
+    """(handle, makes, broadcast) from owner.json first, maker.json (cfg) as fallback."""
+    own = _read_owner()
+    if isinstance(own.get("maker_handle"), str):    # set in the profile (even if left blank)
+        handle = _clean(own["maker_handle"], HANDLE_MAX).strip()
+    else:
+        handle = cfg.get("name", "")
+    if isinstance(own.get("makes"), str):
+        makes = _clean(own["makes"], MAKES_MAX)      # set in the profile (even if cleared)
+    else:
+        makes = cfg.get("makes", "")
+    bc = own.get("broadcast")
+    if not isinstance(bc, bool):
+        bc = cfg.get("broadcast", True)
+    return handle, makes, bc
+
+
+def _save_owner_broadcast(on):
+    """Persist the broadcast flag to owner.json, keeping every other key."""
+    try:
+        d = _read_json(OWNER)
+        d["broadcast"] = bool(on)
+        with open(OWNER, "w") as f:
+            json.dump(d, f)
+    except Exception as ex:
+        print("maker: could not save", OWNER, ex)
+
+
+def _parse(adv):
+    """Our own parser (fallback for presence.parse): full advert -> (id_hex, text) or None."""
+    n = len(adv)
+    j = _find_mfr(adv, n)
+    if j < 0:
+        return None
+    end = j - 1 + adv[j - 2]
+    d = adv[j:end]
+    if len(d) < 2 + 4 + 1 + 3 or d[6] != VERSION:
+        return None
+    bid = "".join("%02x" % b for b in d[7:10])
+    return bid, _clean("".join(chr(c) for c in d[10:10 + NAME_MAX]), NAME_MAX)
+
+
+def _parse_any(adv):
+    if _presence is not None:
+        try:
+            r = _presence.parse(adv)
+            if (isinstance(r, tuple) and len(r) == 2 and _valid_id(r[0])
+                    and isinstance(r[1], str)):
+                return r[0].lower(), _clean(r[1], NAME_MAX)
+        except Exception:
+            pass
+    return _parse(adv)
+
+
 def _adv_payload(badge_id, name):
     mfr = COMPANY + MAGIC + bytes([VERSION]) + ubinascii.unhexlify(badge_id) + name.encode()[:NAME_MAX]
     return b"\x02\x01\x06" + bytes([len(mfr) + 1, 0xFF]) + mfr
@@ -171,6 +298,40 @@ def _find_mfr(adv, n):
     return -1
 
 
+def _logo():
+    """The logo as a framebuf.FrameBuffer, or None if this firmware can't draw it."""
+    global _logo_fb
+    if _logo_fb is None:
+        _logo_fb = False
+        try:
+            import framebuf
+            buf = bytearray(ubinascii.unhexlify(_LOGO_HEX))   # FrameBuffer needs a writable buffer
+            if len(buf) == ((LOGO_W + 7) // 8) * LOGO_H:
+                _logo_fb = framebuf.FrameBuffer(buf, LOGO_W, LOGO_H, framebuf.MONO_HLSB)
+            else:
+                print("maker: logo data has the wrong size")
+        except Exception as ex:
+            print("maker: logo unavailable:", ex)
+    return _logo_fb or None
+
+
+def _draw_logo():
+    """Blit the logo into the black framebuffer (call after LVGL has flushed, before
+    display.update()). Only black pixels are set (key=0), so the white LVGL background
+    shows through. Never raises: no logo is better than no screen."""
+    try:
+        fb = _logo()
+        black = getattr(display, "black", None)
+        if fb is None or black is None:
+            return
+        black.blit(fb, LOGO_X, LOGO_Y, 0)
+        red = getattr(display, "red", None)
+        if red is not None:          # keep logo pixels pure black (red plane wins otherwise)
+            red.fill_rect(LOGO_X, LOGO_Y, LOGO_W, LOGO_H, 0)
+    except Exception as ex:
+        print("maker: logo draw failed:", ex)
+
+
 def _proximity(rssi):
     if rssi >= -62:
         return "near", (0, 3, 0)
@@ -183,8 +344,22 @@ class MakerDetectorApp(BaseApp):
     def __init__(self, name=None):
         super().__init__("Maker Detector")
         self.sleep_ms = 200            # BaseApp.arun() awaits this between run() calls
-        self.cfg = _load_config()
-        self._my_id = ubinascii.unhexlify(self.cfg["id"])
+        self.cfg = _load_config()      # maker.json: legacy id + fallback identity
+        self.presence = None           # lib.presence module when usable
+        self.my_id = self.cfg["id"]
+        if _presence is not None:
+            try:
+                _presence.start()      # idempotent; main.py normally did this already
+                pid = _presence.badge_id()
+                if _valid_id(pid):
+                    self.my_id = pid.lower()
+                    self.presence = _presence
+                else:
+                    print("maker: presence.badge_id() invalid, advertising ourselves")
+            except Exception as ex:
+                print("maker: lib.presence unusable, advertising ourselves:", ex)
+        self.handle, self.makes, self.broadcast = _identity(self.cfg)
+        self._sync_broadcast()
         self.peers = {}                # id -> [name, rssi(smoothed), last_seen_s, first_seen_s]
         self._pending = []             # (bytes mfr data, rssi) queued by the IRQ, bounded
         self._bits = bytearray(_BITS // 8)   # address-hash bitmap for this burst
@@ -200,26 +375,94 @@ class MakerDetectorApp(BaseApp):
         self.ble = None
         try:
             self.ble = bluetooth.BLE()
-            self.ble.active(True)
+            # Never active(True) an already-active radio: on this firmware that restarts the
+            # stack and silently drops lib.presence's advert (started just above).
+            if not self.ble.active():
+                self.ble.active(True)
             self.ble.irq(self._irq)
             self._apply_broadcast()
         except Exception as ex:   # never break boot
             print("maker: BLE init failed:", ex)
 
     # ---------------------------------------------------------------- BLE
+    def _sync_broadcast(self):
+        """With lib.presence, its enabled() is the truth for the broadcast flag."""
+        if self.presence is not None:
+            try:
+                self.broadcast = bool(self.presence.enabled())
+            except Exception as ex:
+                print("maker: presence.enabled() failed:", ex)
+
     def _apply_broadcast(self):
         if not self.ble:
             return
+        if self.presence is not None:
+            return                 # lib.presence advertises; never advertise twice
         try:
-            if self.cfg["broadcast"]:
-                self.ble.gap_advertise(ADV_INTERVAL_US, _adv_payload(self.cfg["id"], self.cfg["name"]),
+            if self.broadcast:
+                name = _clean(self.handle, NAME_MAX)
+                self.ble.gap_advertise(ADV_INTERVAL_US, _adv_payload(self.my_id, name),
                                        connectable=False)
-                print("maker: broadcasting as", self.cfg["id"], repr(self.cfg["name"]))
+                print("maker: broadcasting as", self.my_id, repr(name))
             else:
                 self.ble.gap_advertise(None)
                 print("maker: broadcasting off")
         except Exception as ex:
             print("maker: advertise failed:", ex)
+
+    def _ensure_ble(self):
+        """lib.presence shares the one BLE object: make sure it's still on and the IRQ
+        handler is ours (presence doesn't scan, but may have (re)activated the radio)."""
+        if not self.ble:
+            return
+        try:
+            if not self.ble.active():
+                self.ble.active(True)
+            self.ble.irq(self._irq)
+        except Exception as ex:
+            print("maker: BLE re-arm failed:", ex)
+
+    def _toggle_broadcast(self):
+        on = not self.broadcast
+        if self.presence is not None:
+            try:
+                self.presence.set_broadcast(on)    # persists to owner.json and (re)applies
+            except Exception as ex:
+                print("maker: presence.set_broadcast failed:", ex)
+            self._sync_broadcast()
+            self._ensure_ble()
+            return
+        self.broadcast = on
+        _save_owner_broadcast(on)
+        self.cfg["broadcast"] = on                 # keep maker.json in sync for old tools
+        _save_config(self.cfg)
+        self._apply_broadcast()
+
+    def _refresh_identity(self):
+        """Re-read owner.json/maker.json on app entry (Badge Manager may have changed them)."""
+        try:
+            fresh = _read_json(CONFIG)       # fallback values may have changed too (id: never)
+            for key, limit in (("name", NAME_MAX), ("makes", MAKES_MAX)):
+                if isinstance(fresh.get(key), str):
+                    self.cfg[key] = _clean(fresh[key], limit)
+            new = _identity(self.cfg)
+        except Exception as ex:
+            print("maker: identity reload failed:", ex)
+            return
+        if self.presence is not None:
+            self.handle, self.makes = new[0], new[1]
+            try:
+                self.presence.refresh()
+            except Exception as ex:
+                print("maker: presence.refresh failed:", ex)
+            self._sync_broadcast()
+            self._ensure_ble()
+            return
+        changed = (_clean(new[0], NAME_MAX) != _clean(self.handle, NAME_MAX)
+                   or new[2] != self.broadcast)
+        self.handle, self.makes, self.broadcast = new
+        if changed:
+            self._apply_broadcast()
 
     def _irq(self, event, data):
         # Keep this short: it runs once per advert heard, which in a crowded hall is
@@ -241,8 +484,7 @@ class MakerDetectorApp(BaseApp):
                 j = _find_mfr(adv, n)
                 if j < 0 or len(self._pending) >= MAX_PENDING:
                     return
-                end = j - 1 + adv[j - 2]     # end of this AD field
-                self._pending.append((bytes(adv[j:end]), data[3]))
+                self._pending.append((bytes(adv), data[3]))   # <= 31 bytes; parsed in run()
             elif event == _IRQ_SCAN_DONE:
                 self._scan_done = True
         except Exception:
@@ -289,12 +531,12 @@ class MakerDetectorApp(BaseApp):
         q = self._pending
         self._pending = []
         now = time.time()
-        for d, rssi in q:
+        for adv, rssi in q:
             try:
-                if len(d) < 2 + 4 + 1 + 3 or d[7:10] == self._my_id:
+                r = _parse_any(adv)
+                if r is None or r[0] == self.my_id:
                     continue
-                bid = "".join("%02x" % b for b in d[7:10])
-                name = _clean("".join(chr(c) for c in d[10:10 + NAME_MAX]), NAME_MAX)
+                bid, name = r
                 p = self.peers.get(bid)
                 if p is None:
                     if len(self.peers) >= MAX_PEERS:
@@ -341,8 +583,8 @@ class MakerDetectorApp(BaseApp):
             lb.set_text("")
             return lb
 
-        self.l_title = label(24, 16, lvgl.font_montserrat_48, _RED)
-        self.l_me = label(24, 78, lvgl.font_montserrat_24, _BLACK)
+        self.l_title = label(TEXT_X, 16, lvgl.font_montserrat_48, _RED)
+        self.l_me = label(TEXT_X, 78, lvgl.font_montserrat_24, _BLACK)
         self.l_count = label(24, 130, lvgl.font_montserrat_48, _BLACK)
         self.l_names = label(24, 205, lvgl.font_montserrat_24, _BLACK)
         self.l_prox = label(520, 205, lvgl.font_montserrat_24, _RED)
@@ -356,13 +598,16 @@ class MakerDetectorApp(BaseApp):
     def _draw(self, live):
         if self.scr is None:
             self._build()
-        me = self.cfg["name"] or ("badge " + self.cfg["id"])
-        line = (("Broadcasting as: " + me) if self.cfg["broadcast"]
+        me = self.handle or ("badge " + self.my_id)
+        line = (("Broadcasting as: " + me) if self.broadcast
                 else "Not broadcasting (press B to start)")
-        if self.cfg.get("makes"):
-            line += _SEP + "makes " + self.cfg["makes"]
-        # ~13 px/char at 24 px, ~9 px/char at 16 px; keep the line on one row (912 px)
-        self.l_me.set_style_text_font(lvgl.font_montserrat_24 if len(line) <= 66
+        if self.makes:
+            line += _SEP + "makes " + self.makes
+        # ~13 px/char at 24 px, ~9 px/char at 16 px; keep the line on one row right of the
+        # logo (960 - TEXT_X - 24 = 800 px): <= 60 chars at 24 px, else 16 px, clipped at 88.
+        if len(line) > 88:
+            line = line[:85] + "..."
+        self.l_me.set_style_text_font(lvgl.font_montserrat_24 if len(line) <= 60
                                       else lvgl.font_montserrat_16, 0)
         self.l_me.set_text(line)
         n = len(live)
@@ -379,7 +624,8 @@ class MakerDetectorApp(BaseApp):
         lvgl.screen_load(self.scr)
         self.scr.update_layout()
         self.scr.invalidate()
-        lvgl.refr_now(display.lv_display)
+        lvgl.refr_now(display.lv_display)    # LVGL flushes into the framebuffers here
+        _draw_logo()                          # then the logo goes on top
         display.update()
         self.drawn = self._snapshot(live)
         self.last_draw = time.time()
@@ -394,6 +640,7 @@ class MakerDetectorApp(BaseApp):
         now = time.time()
         if self.launched or now - self.last_run > 5:
             self.drawn = None          # force a redraw on entry
+            self._refresh_identity()
             # we were away: if the last burst should long be over, don't wait for the watchdog
             if (self.ble and self.scanning and not self._scan_done
                     and time.ticks_diff(time.ticks_ms(), self._scan_started) > SCAN_MS + 1_000):
@@ -410,9 +657,10 @@ class MakerDetectorApp(BaseApp):
             print("maker: drain error:", ex)
 
         if UserB.pressed():
-            self.cfg["broadcast"] = not self.cfg["broadcast"]
-            _save_config(self.cfg)
-            self._apply_broadcast()
+            try:
+                self._toggle_broadcast()
+            except Exception as ex:
+                print("maker: toggle failed:", ex)
             self.drawn = None
         force = UserA.pressed()
 

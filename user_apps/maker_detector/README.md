@@ -9,7 +9,8 @@ format is unchanged, so badges running either version see each other.
 ## Install
 
 Copy `apps/maker_detector.py` into `/apps/` on the badge and reboot. The app switcher
-finds it on its own.
+finds it on its own. That one file is all it needs: the Hackaday logo on its screen is
+built into it (no image file to copy).
 
 **Menu position:** the app files are discovered alphabetically. With the stock apps it
 goes `gallery`, **`maker_detector`**, `nametag`, `schedule`, so it is **#2** on the LED
@@ -23,7 +24,9 @@ Sun Talks, Workshops.
 | User A | redraw the screen now |
 | User B | turn broadcasting on/off (saved) |
 
-- **Screen:** shows your own line ("Broadcasting as: Dave  •  makes robots"), how many
+- **Screen:** the Hackaday "Jolly Wrencher" logo top left, the red MAKER DETECTOR title
+  beside it, then your own line ("Broadcasting as: dave  •  makes robots"; the makes
+  part is left out when you haven't set one), how many
   other makers are in range, and up to 16 names, each with near / same room / far and the
   RSSI. The footer shows about how many Bluetooth devices were heard in the last scan burst.
 - **LED bar:** one LED per badge seen in the last minute (green = near, yellow = same room,
@@ -32,20 +35,60 @@ Sun Talks, Workshops.
 - **Advertising** starts at boot, so other badges can see you while you use a different app.
   **Scanning** only runs while this app is open.
 
-## Settings: `/data/maker.json`
+## The logo
+
+The 92x92 Jolly Wrencher is stored in `maker_detector.py` as a 1-bit bitmap (1,104 bytes,
+hex). After LVGL has drawn the screen into the e-paper framebuffers, the app copies the
+logo into the black framebuffer with `framebuf.blit()` and then starts the panel refresh.
+This needs no PNG file and no PNG decoding, and uses no LVGL memory. If the firmware has no
+`display.black` framebuffer, or drawing fails for any other reason, the screen appears
+without the logo and the app keeps running. The source image is in
+`assets/jolly_wrencher_src.png`, for reference only; nothing reads it on the badge.
+
+Your own line ("Broadcasting as ...") starts right of the logo, so it has about 800 px:
+up to 60 characters at 24 px, otherwise 16 px. Lines over 88 characters are cut off with
+"...".
+
+## With or without `lib/presence.py`
+
+The upstream "BLE presence broadcast" firmware change adds `lib/presence.py`, which
+advertises the badge in exactly this app's over-the-air format. The app checks for it at
+import time (a missing or broken module is fine):
+
+| | `lib/presence.py` installed | not installed (stock firmware) |
+|---|---|---|
+| who advertises | `lib/presence.py` (the app never advertises, so there is only one advert) | the app itself, from boot |
+| badge id | `presence.badge_id()` (it adopts the id from `maker.json` on first use) | `maker.json` `id` |
+| User B | `presence.set_broadcast(not presence.enabled())`, saved to `owner.json` by presence | flips the flag, saved to `owner.json` `"broadcast"` (other keys kept) **and** `maker.json` |
+| parsing adverts | `presence.parse()`, with the app's own parser as fallback | the app's own parser |
+
+Scanning is always done by the app. Each time the app is opened it re-reads the profile
+(and calls `presence.refresh()` when presence is installed), so changes made with the
+Badge Manager show up without a reboot.
+
+## Settings
+
+Identity comes from the owner profile first, `/data/owner.json` (written by the Badge
+Manager; read through `lib/owner.py` when the firmware has it):
+
+```json
+{"maker_handle": "dave", "makes": "robots", "broadcast": true}
+```
+
+Anything missing there falls back to the legacy `/data/maker.json`:
 
 ```json
 {"id": "a1b2c3", "name": "Dave", "makes": "robots", "broadcast": true}
 ```
 
-| key | meaning |
-|---|---|
-| `id` | 6 hex characters, random, created on first boot. Identifies your badge to others. |
-| `name` | Broadcast to other badges. Printable ASCII, at most 16 characters. |
-| `makes` | What you like to make. At most 40 printable ASCII characters. **Shown only on your own screen and never broadcast**, because the 31-byte advert has no room left. |
-| `broadcast` | `true` / `false`. Toggled with User B. |
+| value | from | meaning |
+|---|---|---|
+| handle | `owner.json` `maker_handle`, else `maker.json` `name` | Shown on your screen; broadcast clipped to 16 printable ASCII characters. Empty = "badge a1b2c3". |
+| makes | `owner.json` `makes` (if the key exists, even empty), else `maker.json` `makes` | At most 40 printable ASCII characters. **Shown only on your own screen and never broadcast**, because the 31-byte advert has no room left. |
+| broadcast | `owner.json` `broadcast` (if true/false), else `maker.json` `broadcast` (default true) | Toggled with User B. |
+| id | `presence.badge_id()`, else `maker.json` `id` | 6 hex characters, random, created on first boot. Identifies your badge to others. |
 
-Invalid or missing values are fixed and saved again on boot.
+Invalid or missing values in `maker.json` are fixed and saved again on boot.
 
 **Migration:** if `/data/maker.json` does not exist but `/data/nerd.json` (the old app's
 file) does, `id`, `name` and `broadcast` are copied over. Because the `id` stays the same,
